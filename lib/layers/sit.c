@@ -31,6 +31,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Local helper: safely join parent path and name into destination buffer (always NUL terminates).
+static void sit_join_path(char *dst, size_t dst_cap, const char *parent, const char *name) {
+    if (!dst_cap) return;
+    dst[0] = '\0';
+    if (parent && parent[0]) {
+        size_t pos = 0;
+        size_t lp = strnlen(parent, dst_cap - 1);
+        if (lp) {
+            memcpy(dst, parent, lp);
+            pos = lp;
+        }
+        if (pos < dst_cap - 1) {
+            dst[pos++] = '/';
+        }
+        if (name && pos < dst_cap - 1) {
+            size_t rem = dst_cap - 1 - pos;
+            size_t ln = strnlen(name, rem);
+            if (ln) memcpy(dst + pos, name, ln);
+            pos += ln;
+        }
+        dst[pos < dst_cap ? pos : (dst_cap - 1)] = '\0';
+    } else if (name) {
+        size_t ln = strnlen(name, dst_cap - 1);
+        memcpy(dst, name, ln);
+        dst[ln] = '\0';
+    }
+}
+
 // Forward declarations for LZW (method 2) streaming helpers
 struct lzw_ctx;
 // Initialize an LZW streaming context over a compressed buffer.
@@ -574,12 +602,7 @@ static int sit_build_index_sit5(sit_layer_state_t *st) {
                 }
             }
             char folder_path[512];
-            if (parent_path[0])
-                snprintf(folder_path, sizeof(folder_path), "%s/%s", parent_path, namebuf);
-            else {
-                strncpy(folder_path, namebuf, sizeof(folder_path) - 1);
-                folder_path[sizeof(folder_path) - 1] = '\0';
-            }
+            sit_join_path(folder_path, sizeof(folder_path), parent_path, (const char *)namebuf);
             if (dir_count < MAX_DIRS) {
                 dir_map[dir_count].offset = offs;
                 strncpy(dir_map[dir_count].path, folder_path, sizeof(dir_map[dir_count].path) - 1);
@@ -610,13 +633,8 @@ static int sit_build_index_sit5(sit_layer_state_t *st) {
                 }
             }
         }
-        char full_filename[512];
-        if (parent_path[0])
-            snprintf(full_filename, sizeof(full_filename), "%s/%s", parent_path, namebuf);
-        else {
-            strncpy(full_filename, namebuf, sizeof(full_filename) - 1);
-            full_filename[sizeof(full_filename) - 1] = '\0';
-        }
+    char full_filename[512];
+    sit_join_path(full_filename, sizeof(full_filename), parent_path, (const char *)namebuf);
 
         uint8_t *comp_rsrc = datastart_ptr;
         uint8_t *comp_data = datastart_ptr + (hasresource ? resourcecomplen : 0);

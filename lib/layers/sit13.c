@@ -38,6 +38,11 @@
 #define MAX_CODE      321
 #define INVALID_VALUE (MAX_CODE + 1)
 
+/* Disable missing-braces warning for large generated initializer tables */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-braces"
+#endif
 static const int8_t first_tree_lengths[5][MAX_CODE] = {
     4,  5,  7,  8,  8,  9,  9,  9,  9,  7,  9,  9,  9,  8,  9,  9,  9,  9,  9,  9,  9,  9,  9,  10, 9,  9,  10, 10, 9,
     10, 9,  9,  5,  9,  9,  9,  9,  10, 9,  9,  9,  9,  9,  9,  9,  9,  7,  9,  9,  8,  9,  9,  9,  9,  9,  9,  9,  9,
@@ -170,6 +175,9 @@ struct tree_node {
     struct tree_node *child[2];
     int value;
 };
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 // Allocate and initialize a new tree node
 struct tree_node *new_tree_node(void) {

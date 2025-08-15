@@ -29,6 +29,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#ifndef SSIZE_MAX
+#define SSIZE_MAX ((ssize_t)(SIZE_MAX/2))
+#endif
 
 // --- Utility: big-endian loads (Compact Pro stores multi-byte values big-endian) ---
 #define LOAD_BE16(p) ((uint16_t)((uint8_t *)(p))[0] << 8 | (uint16_t)((uint8_t *)(p))[1])
@@ -195,7 +199,7 @@ typedef struct {
     int maxl;
     int minl;
     struct {
-        unsigned len;
+        uint8_t len; /* prefix length (<= 16) fits in 8 bits */
         int val;
     } *tab;
     struct {
@@ -263,7 +267,9 @@ static int cpt_pfx_build(cpt_pfx_t *pc, const int *lens, int count, int maxLen) 
 built:;
     int tsizebits = (pc->maxl < pc->minl) ? 10 : (pc->maxl >= 10 ? 10 : pc->maxl);
     pc->tbits = tsizebits;
-    int tsize = 1 << tsizebits;
+    unsigned tsizeu = 1u << (unsigned)tsizebits;
+    if (tsizeu > INT32_MAX) return -1;
+    int tsize = (int)tsizeu;
     pc->tab = malloc((size_t)tsize * sizeof(*pc->tab));
     if (!pc->tab)
         return -1;
@@ -272,12 +278,12 @@ built:;
         int depth = 0;
         for (;;) {
             if (cpt_is_leaf(pc, node)) {
-                pc->tab[i].len = (unsigned int)depth;
+                pc->tab[i].len = (uint8_t)depth;
                 pc->tab[i].val = cpt_leaf_val(pc, node);
                 break;
             }
-            if (depth == tsizebits) {
-                pc->tab[i].len = tsizebits + 1;
+            if ((unsigned)depth == (unsigned)tsizebits) {
+                pc->tab[i].len = (uint8_t)(tsizebits + 1);
                 pc->tab[i].val = node;
                 break;
             }
@@ -307,22 +313,22 @@ static void cpt_pfx_free(cpt_pfx_t *pc) {
 static int cpt_pfx_next(cpt_pfx_t *pc, cpt_br_t *br) {
     if (cpt_br_bits_left(br) == 0)
         return -1;
-    unsigned bits = cpt_br_peek(br, pc->tbits);
+    unsigned bits = cpt_br_peek(br, (unsigned)pc->tbits);
     unsigned len = pc->tab[bits].len;
     int val = pc->tab[bits].val;
     if (len == 0)
         return -1;
-    if (len <= pc->tbits) {
+    if (len <= (unsigned)pc->tbits) {
         cpt_br_skip(br, len);
         return val;
     }
-    cpt_br_skip(br, pc->tbits);
+    cpt_br_skip(br, (unsigned)pc->tbits);
     int node = val;
     while (!cpt_is_leaf(pc, node)) {
         if (cpt_br_bits_left(br) == 0)
             return -1;
-        int bit = cpt_br_get(br, 1);
-        int next = bit ? pc->tree[node].b1 : pc->tree[node].b0;
+        unsigned bit = cpt_br_get(br, 1);
+    int next = bit ? pc->tree[node].b1 : pc->tree[node].b0;
         if (next < 0)
             return -1;
         node = next;
@@ -355,20 +361,20 @@ static void cpt_lzh_core_init_supplier(cpt_lzh_core_t *lz, int (*src)(void *, in
 }
 
 static int cpt_lzh_build_tables(cpt_lzh_core_t *lz) {
-    int numbytes;
+    unsigned numbytes;
     int lens[256];
     memset(lens, 0, sizeof(lens));
-    if (cpt_br_bits_left(&lz->br) < 8)
+    if (cpt_br_bits_left(&lz->br) < 8u)
         return -1;
     numbytes = cpt_br_get(&lz->br, 8);
-    if (numbytes * 2 > 256)
+    if (numbytes * 2u > 256u)
         return -1;
-    for (int i = 0; i < numbytes; i++) {
-        if (cpt_br_bits_left(&lz->br) < 8)
+    for (unsigned i = 0; i < numbytes; i++) {
+    if (cpt_br_bits_left(&lz->br) < 8u)
             return -1;
-        int v = cpt_br_get(&lz->br, 8);
-        lens[2 * i] = v >> 4;
-        lens[2 * i + 1] = v & 0x0f;
+    unsigned v = cpt_br_get(&lz->br, 8);
+    lens[2 * i] = (int)(v >> 4);
+    lens[2 * i + 1] = (int)(v & 0x0f);
     }
     if (cpt_pfx_build(&lz->lit, lens, 256, 15))
         return -1;
@@ -376,17 +382,17 @@ static int cpt_lzh_build_tables(cpt_lzh_core_t *lz) {
 
     int lens2[64];
     memset(lens2, 0, sizeof(lens2));
-    if (cpt_br_bits_left(&lz->br) < 8)
+    if (cpt_br_bits_left(&lz->br) < 8u)
         return -1;
     numbytes = cpt_br_get(&lz->br, 8);
-    if (numbytes * 2 > 64)
+    if (numbytes * 2u > 64u)
         return -1;
-    for (int i = 0; i < numbytes; i++) {
-        if (cpt_br_bits_left(&lz->br) < 8)
+    for (unsigned i = 0; i < numbytes; i++) {
+    if (cpt_br_bits_left(&lz->br) < 8u)
             return -1;
-        int v = cpt_br_get(&lz->br, 8);
-        lens2[2 * i] = v >> 4;
-        lens2[2 * i + 1] = v & 0x0f;
+    unsigned v = cpt_br_get(&lz->br, 8);
+    lens2[2 * i] = (int)(v >> 4);
+    lens2[2 * i + 1] = (int)(v & 0x0f);
     }
     if (cpt_pfx_build(&lz->lenp, lens2, 64, 15))
         return -1;
@@ -394,17 +400,17 @@ static int cpt_lzh_build_tables(cpt_lzh_core_t *lz) {
 
     int lens3[128];
     memset(lens3, 0, sizeof(lens3));
-    if (cpt_br_bits_left(&lz->br) < 8)
+    if (cpt_br_bits_left(&lz->br) < 8u)
         return -1;
     numbytes = cpt_br_get(&lz->br, 8);
-    if (numbytes * 2 > 128)
+    if (numbytes * 2u > 128u)
         return -1;
-    for (int i = 0; i < numbytes; i++) {
-        if (cpt_br_bits_left(&lz->br) < 8)
+    for (unsigned i = 0; i < numbytes; i++) {
+    if (cpt_br_bits_left(&lz->br) < 8u)
             return -1;
-        int v = cpt_br_get(&lz->br, 8);
-        lens3[2 * i] = v >> 4;
-        lens3[2 * i + 1] = v & 0x0f;
+    unsigned v = cpt_br_get(&lz->br, 8);
+    lens3[2 * i] = (int)(v >> 4);
+    lens3[2 * i + 1] = (int)(v & 0x0f);
     }
     if (cpt_pfx_build(&lz->offp, lens3, 128, 15))
         return -1;
@@ -491,7 +497,7 @@ static int cpt_lzhs_next(cpt_lzh_supplier_t *s, int *outbyte) {
         }
         if (cpt_br_bits_left(&s->core.br) == 0)
             return 0;
-        unsigned flag = cpt_br_get(&s->core.br, 1);
+        unsigned flag = cpt_br_get(&s->core.br, 1U);
         if (flag) {
             s->core.blockcount += 2;
             int sym = cpt_pfx_next(&s->core.lit, &s->core.br);
@@ -510,12 +516,12 @@ static int cpt_lzhs_next(cpt_lzh_supplier_t *s, int *outbyte) {
             int osym = cpt_pfx_next(&s->core.offp, &s->core.br);
             if (osym < 0)
                 return 0;
-            unsigned off = (unsigned)osym << 6;
-            off |= cpt_br_get(&s->core.br, 6);
+            unsigned off = ((unsigned)osym) << 6;
+            off |= cpt_br_get(&s->core.br, 6U);
             unsigned mlen = (unsigned)lsym;
             if (mlen == 0)
                 return 0;
-            size_t start = s->core.pos - off;
+            size_t start = s->core.pos - (size_t)off;
             uint8_t first = s->core.win[start & s->core.wmask];
             s->core.win[s->core.pos & s->core.wmask] = first;
             s->core.pos++;
@@ -598,27 +604,34 @@ static ssize_t cpt_rle_stream_read(cpt_rle_stream_t *st, uint8_t *out, size_t ou
             st->half = 0;
         } else {
             if (!st->getb(st->ctx, &byte)) {
-                return dp;
+                if (dp > (size_t)SSIZE_MAX) return -1;
+                return (ssize_t)dp;
             }
         }
         if (byte == 0x81) {
             int b2;
             if (!st->getb(st->ctx, &b2)) { /* need more source; return partial */
-                return dp;
+                if (dp > (size_t)SSIZE_MAX) return -1;
+                return (ssize_t)dp;
             }
             if (b2 == 0x82) {
                 int n;
                 if (!st->getb(st->ctx, &n)) {
-                    return dp;
+                    if (dp > (size_t)SSIZE_MAX) return -1;
+                    return (ssize_t)dp;
                 }
                 if (n != 0) {
                     st->repeat = n - 2;
-                    if (dp >= outlen)
+                    if (dp >= outlen) {
+                        if (dp > (size_t)SSIZE_MAX) return -1;
                         return (ssize_t)dp;
+                    }
                     out[dp++] = (uint8_t)st->saved;
                 } else {
-                    if (dp >= outlen)
+                    if (dp >= outlen) {
+                        if (dp > (size_t)SSIZE_MAX) return -1;
                         return (ssize_t)dp;
+                    }
                     out[dp++] = 0x81;
                     st->saved = 0x82;
                     st->repeat = 1;
@@ -627,24 +640,31 @@ static ssize_t cpt_rle_stream_read(cpt_rle_stream_t *st, uint8_t *out, size_t ou
                 if (b2 == 0x81) {
                     st->half = 1;
                     st->saved = 0x81;
-                    if (dp >= outlen)
+                    if (dp >= outlen) {
+                        if (dp > (size_t)SSIZE_MAX) return -1;
                         return (ssize_t)dp;
+                    }
                     out[dp++] = 0x81;
                 } else {
-                    if (dp >= outlen)
+                    if (dp >= outlen) {
+                        if (dp > (size_t)SSIZE_MAX) return -1;
                         return (ssize_t)dp;
+                    }
                     out[dp++] = 0x81;
                     st->saved = b2;
                     st->repeat = 1;
                 }
             }
         } else {
-            if (dp >= outlen)
+            if (dp >= outlen) {
+                if (dp > (size_t)SSIZE_MAX) return -1;
                 return (ssize_t)dp;
+            }
             st->saved = byte;
             out[dp++] = (uint8_t)byte;
         }
     }
+    if (dp > (size_t)SSIZE_MAX) return -1;
     return (ssize_t)dp;
 }
 

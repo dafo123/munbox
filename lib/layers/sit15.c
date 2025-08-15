@@ -296,7 +296,8 @@ static void reset_mtf_decoder(mtf_state_t *mtf) {
 static int decode_mtf_symbol(mtf_state_t *mtf, int symbol) {
     int value = mtf->table[symbol];
     if (symbol > 0) {
-        memmove(&mtf->table[1], &mtf->table[0], symbol * sizeof(int));
+        size_t count = (size_t)symbol; /* symbol in [0,255] */
+        memmove(&mtf->table[1], &mtf->table[0], count * sizeof(int));
     }
     mtf->table[0] = value;
     return value;
@@ -319,8 +320,10 @@ static void prepare_inverse_bwt_transform(uint32_t *transform_array, const uint8
     }
 
     for (int i = 0; i < block_len; i++) {
-        transform_array[cumulative_counts[block_data[i]] + counts[block_data[i]]] = i;
-        counts[block_data[i]]++;
+        int b = block_data[i];
+        int pos = cumulative_counts[b] + counts[b];
+        transform_array[(size_t)pos] = (uint32_t)i;
+        counts[b]++;
     }
 }
 
@@ -353,12 +356,18 @@ size_t sit15_decompress(uint8_t *dst, size_t dst_len, const uint8_t *src, size_t
         handle_error(state); // Invalid signature
     }
     state->block_bits = decode_arithmetic_bit_string(state, &state->primary_model, 4);
-    state->block_size = 1 << (state->block_bits + 9);
+    /* block_size is always positive and fits in int (block_bits in [0,15]) but
+       we compute using unsigned to avoid sign-conversion warnings, then range check. */
+    unsigned computed_block_size = 1u << (unsigned)(state->block_bits + 9);
+    if (computed_block_size > (unsigned)INT32_MAX) {
+        handle_error(state);
+    }
+    state->block_size = (int)computed_block_size; /* <= 1<<(4+9)=8192 typical */
     state->end_of_stream_reached = decode_arithmetic_symbol(state, &state->primary_model);
 
     // Allocate buffers based on block size from header
-    state->mtf_output_buffer = (uint8_t *)malloc(state->block_size);
-    state->bwt_transform_array = (uint32_t *)malloc(state->block_size * sizeof(uint32_t));
+    state->mtf_output_buffer = (uint8_t *)malloc((size_t)state->block_size);
+    state->bwt_transform_array = (uint32_t *)malloc((size_t)state->block_size * sizeof(uint32_t));
     if (!state->mtf_output_buffer || !state->bwt_transform_array)
         handle_error(state);
 
@@ -400,8 +409,8 @@ static uint8_t decompress_byte(decompressor_state_t *state) {
         if (byte == 0) { // Special case: a zero byte here means retry
             return decompress_byte(state);
         }
-        state->final_rle_repeat_count = byte - 1;
-        return state->final_rle_last_byte;
+    state->final_rle_repeat_count = (int)byte - 1;
+    return (uint8_t)state->final_rle_last_byte;
     } else {
         if (byte == state->final_rle_last_byte) {
             state->final_rle_consecutive_count++;
@@ -458,7 +467,7 @@ static void decode_and_prepare_next_block(decompressor_state_t *state) {
                 handle_error(state);
 
             int zero_value = decode_mtf_symbol(&state->mtf_state, 0);
-            memset(&state->mtf_output_buffer[state->bytes_decoded_in_block], zero_value, zero_run_count);
+            memset(&state->mtf_output_buffer[state->bytes_decoded_in_block], zero_value, (size_t)zero_run_count);
             state->bytes_decoded_in_block += zero_run_count;
 
             if (selector == 10)
@@ -475,7 +484,7 @@ static void decode_and_prepare_next_block(decompressor_state_t *state) {
         // STAGE 3: MTF Decode the symbol and store in buffer
         if (state->bytes_decoded_in_block >= state->block_size)
             handle_error(state);
-        state->mtf_output_buffer[state->bytes_decoded_in_block++] = decode_mtf_symbol(&state->mtf_state, symbol);
+    state->mtf_output_buffer[state->bytes_decoded_in_block++] = (uint8_t)decode_mtf_symbol(&state->mtf_state, symbol);
     }
 
     if (state->bwt_primary_index >= state->bytes_decoded_in_block && state->bytes_decoded_in_block > 0)
@@ -509,7 +518,9 @@ static void decode_and_prepare_next_block(decompressor_state_t *state) {
 // Reconstruct one byte using the inverse BWT transform and apply randomization.
 static uint8_t reconstruct_byte_from_bwt(decompressor_state_t *state) {
     // STAGE 4: Inverse BWT (Byte Reconstruction)
-    state->bwt_current_index = state->bwt_transform_array[state->bwt_current_index];
+    state->bwt_current_index = (int)state->bwt_transform_array[state->bwt_current_index];
+    if (state->bwt_current_index < 0 || state->bwt_current_index >= state->bytes_decoded_in_block)
+        handle_error(state);
     uint8_t byte = state->mtf_output_buffer[state->bwt_current_index];
 
     // STAGE 5: Randomization XOR
@@ -549,11 +560,15 @@ sit15_ctx_t *sit15_init(const uint8_t *src, size_t src_len) {
         handle_error(st);
     }
     st->block_bits = decode_arithmetic_bit_string(st, &st->primary_model, 4);
-    st->block_size = 1 << (st->block_bits + 9);
+    unsigned computed_block_size2 = 1u << (unsigned)(st->block_bits + 9);
+    if (computed_block_size2 > (unsigned)INT32_MAX) {
+        handle_error(st);
+    }
+    st->block_size = (int)computed_block_size2;
     st->end_of_stream_reached = decode_arithmetic_symbol(st, &st->primary_model);
 
-    st->mtf_output_buffer = (uint8_t *)malloc(st->block_size);
-    st->bwt_transform_array = (uint32_t *)malloc(st->block_size * sizeof(uint32_t));
+    st->mtf_output_buffer = (uint8_t *)malloc((size_t)st->block_size);
+    st->bwt_transform_array = (uint32_t *)malloc((size_t)st->block_size * sizeof(uint32_t));
     if (!st->mtf_output_buffer || !st->bwt_transform_array)
         handle_error(st);
 
