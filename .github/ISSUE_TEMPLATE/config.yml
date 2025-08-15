@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/dafo123/munbox-test/tree/main/docs
+    about: Check the documentation for detailed information about munbox
+  - name: 💬 Discussions
+    url: https://github.com/dafo123/munbox-test/discussions
+    about: Ask questions and discuss munbox with the community

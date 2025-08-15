@@ -1,0 +1,33 @@
+name: Munbox Test System
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMUNBOX_BUILD_SHARED=ON
+          cmake --build build -- -j
+
+      - name: Run tests (CTest)
+        run: |
+          # Ensure runtime loader can find shared libraries from the build tree.
+          export LD_LIBRARY_PATH="${{ github.workspace }}/build/lib:${LD_LIBRARY_PATH:-}"
+          cd build
+          ctest --output-on-failure --parallel 2 || (echo "CTest failed" && exit 1)
+
+      - name: Legacy shell harness (fallback)
+        run: |
+          cd test
+          chmod +x run_tests.sh
+          # Allow the munbox executable to find shared libraries built in-tree
+          export LD_LIBRARY_PATH="${{ github.workspace }}/build/lib:${LD_LIBRARY_PATH:-}"
+          ./run_tests.sh --verbose --munbox ../build/cmd/munbox || true

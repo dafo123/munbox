@@ -1,0 +1,70 @@
+name: Question
+description: Ask a question about munbox
+title: "[QUESTION] "
+labels: ["question", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about munbox? We're here to help!
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Question Category
+      description: What is your question about?
+      options:
+        - General usage
+        - Installation/Building
+        - Archive format compatibility
+        - API usage
+        - Performance
+        - Documentation
+        - Contributing
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+      description: Please describe your question clearly
+      placeholder: What would you like to know?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Please provide any relevant context that might help us answer your question
+      placeholder: |
+        - What are you trying to achieve?
+        - What have you tried so far?
+        - Any relevant details about your setup or use case
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Information
+      description: Anything else that might be helpful?
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before asking
+      description: Please confirm you've checked these resources
+      options:
+        - label: I have read the README
+        - label: I have checked existing issues and discussions
+        - label: I have looked at the documentation in the docs/ folder
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our Code of Conduct
+      options:
+        - label: I agree to follow this project's Code of Conduct
+          required: true

@@ -1,0 +1,13 @@
+# Config file for the munbox package
+# Provides imported targets: munbox::munbox_static and/or munbox::munbox_shared
+
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/munboxTargets.cmake")
+
+# Choose a default munbox::munbox alias if only one kind of library is installed
+if(NOT TARGET munbox::munbox AND TARGET munbox::munbox_shared)
+    add_library(munbox::munbox ALIAS munbox::munbox_shared)
+elseif(NOT TARGET munbox::munbox AND TARGET munbox::munbox_static)
+    add_library(munbox::munbox ALIAS munbox::munbox_static)
+endif()
