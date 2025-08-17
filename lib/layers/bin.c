@@ -37,6 +37,9 @@
 
 // Skip and discard 'n' bytes from 'src' (forward declaration)
 static int skip_bytes(munbox_layer_t *src, size_t n);
+static int read_fully(munbox_layer_t *src, uint8_t *buf, size_t n); // forward
+static uint16_t be16(const uint8_t *p); // forward
+static uint32_t be32(const uint8_t *p); // forward
 
 // Detect if a buffer appears to be a StuffIt archive (classic or SIT5)
 static bool looks_like_sit(const uint8_t *buf, size_t len) {
@@ -99,6 +102,7 @@ typedef struct {
     bool started_read; // true after first read() call
     bool opened; // true after open(FIRST) called; required before read()
     uint32_t data_total; // total data fork length
+    bool ever_read; // indicates any bytes consumed since last (FIRST) open; triggers rewind on next FIRST
 } bin_layer_state_t;
 
 // Read up to 'cnt' bytes from the currently selected fork in the bin layer
@@ -135,6 +139,7 @@ static ssize_t bin_layer_read(munbox_layer_t *self, void *buf, size_t cnt) {
     if (r < 0)
         return r;
     st->data_rem -= (uint32_t)r;
+    if (r > 0) st->ever_read = true;
     return r;
 }
 
@@ -158,12 +163,78 @@ static int bin_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
         return munbox_error("Invalid parameters to bin_layer_open");
 
     if (what == MUNBOX_OPEN_FIRST) {
-        if (st->started_read) {
-            return munbox_error("cannot restart iteration after reading began"); // Not rewindable
+        // Rewind & reparse if any bytes have been consumed already
+        if (st->ever_read) {
+            if (!st->source->open)
+                return munbox_error("underlying source cannot rewind for bin FIRST");
+            munbox_file_info_t dummy;
+            if (st->source->open(st->source, MUNBOX_OPEN_FIRST, &dummy) < 0)
+                return munbox_error("failed to rewind underlying source for bin FIRST");
+            // Reparse header & metadata (shared logic inline to avoid code duplication with factory)
+            uint8_t hdr[MB_BLOCK_SIZE];
+            if (read_fully(st->source, hdr, sizeof(hdr)) != 0)
+                return munbox_error("bin rewind: failed reading header");
+            uint8_t ver = hdr[0];
+            uint8_t name_len = hdr[1];
+            if (!((ver == 0) || (ver == 1)) || ver != 0 || hdr[74] != 0 || name_len == 0 || name_len > 63)
+                return munbox_error("bin rewind: invalid header");
+            uint16_t crc_calc = crc16_xmodem_update(0, hdr, 124);
+            uint16_t crc_stored = be16(hdr + 124);
+            if (crc_calc != crc_stored && hdr[82] != 0)
+                return munbox_error("bin rewind: CRC mismatch");
+            uint16_t sec_len = be16(hdr + 120);
+            if (sec_len > 0) {
+                if (skip_bytes(st->source, sec_len) != 0)
+                    return munbox_error("bin rewind: failed skipping secondary header");
+                size_t pad = (size_t)(MB_BLOCK_SIZE - (sec_len % MB_BLOCK_SIZE)) % MB_BLOCK_SIZE;
+                if (pad && skip_bytes(st->source, pad) != 0)
+                    return munbox_error("bin rewind: failed skipping secondary header pad");
+            }
+            // Re-populate metadata
+            memset(&st->file_info, 0, sizeof(st->file_info));
+            size_t copy_len = name_len < sizeof(st->file_info.filename) - 1 ? name_len : sizeof(st->file_info.filename) - 1;
+            memcpy(st->file_info.filename, hdr + 2, copy_len);
+            st->file_info.filename[copy_len] = '\0';
+            st->file_info.type = be32(hdr + 65);
+            st->file_info.creator = be32(hdr + 69);
+            uint16_t finder_flags = ((uint16_t)hdr[73] << 8) | hdr[101];
+            finder_flags &= (uint16_t)~((1u << 0) | (1u << 1) | (1u << 8) | (1u << 9) | (1u << 10));
+            st->file_info.finder_flags = finder_flags;
+            st->file_info.has_metadata = true;
+            st->data_total = be32(hdr + 83);
+            st->data_rem = st->data_total;
+            st->rsrc_len = be32(hdr + 87);
+            st->streaming_rsrc = false; // will be recalculated via sniff
+            st->started_read = false;
+            st->opened = false;
+            st->iterating = false;
+            // Perform SIT sniff again
+            uint8_t sniff[128];
+            ssize_t sniffed = st->data_total > 0 ? st->source->read(st->source, sniff, sizeof(sniff)) : 0;
+            // Rewind again to start of forks
+            if (st->source->open(st->source, MUNBOX_OPEN_FIRST, &dummy) < 0)
+                return munbox_error("bin rewind: failed to re-rewind after sniff");
+            if (read_fully(st->source, hdr, sizeof(hdr)) != 0)
+                return munbox_error("bin rewind: failed re-reading header");
+            sec_len = be16(hdr + 120);
+            if (sec_len > 0) {
+                if (skip_bytes(st->source, sec_len) != 0)
+                    return munbox_error("bin rewind: failed skipping secondary header (2)");
+                size_t pad2 = (size_t)(MB_BLOCK_SIZE - (sec_len % MB_BLOCK_SIZE)) % MB_BLOCK_SIZE;
+                if (pad2 && skip_bytes(st->source, pad2) != 0)
+                    return munbox_error("bin rewind: failed skipping secondary header pad (2)");
+            }
+            bool data_is_sit = (sniffed > 0) && looks_like_sit(sniff, (size_t)sniffed);
+            if (!data_is_sit && st->rsrc_len > 0)
+                st->streaming_rsrc = true;
+            st->ever_read = false; // fresh state until new reads occur
         }
         st->iterating = true;
         st->started_read = false;
         st->opened = true;
+        // Ensure data_rem reset if rewound but not iterating earlier
+        if (!st->streaming_rsrc)
+            st->data_rem = st->data_total;
         // Start at data fork if present; otherwise resource (order unspecified)
         if (st->data_total > 0) {
             st->streaming_rsrc = false;
@@ -194,10 +265,12 @@ static int bin_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
             if (remaining > 0) {
                 if (skip_bytes(st->source, remaining) != 0)
                     return MUNBOX_ERROR;
+                if (remaining > 0) st->ever_read = true;
             }
             size_t pad = (MB_BLOCK_SIZE - (st->data_total % MB_BLOCK_SIZE)) % MB_BLOCK_SIZE;
             if (pad && skip_bytes(st->source, pad) != 0)
                 return MUNBOX_ERROR;
+            if (pad) st->ever_read = true;
             st->streaming_rsrc = true;
             st->data_rem = st->rsrc_len;
             st->started_read = false;

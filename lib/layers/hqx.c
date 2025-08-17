@@ -88,6 +88,7 @@ typedef struct {
     // Iteration state for open()/NEXT
     bool iterating;
     bool opened; // require open() before read()
+    bool ever_read; // indicates bytes have been read since last (FIRST) open; triggers rewind on next FIRST
 } hqx_layer_state_t;
 
 // --- Layer Implementation ---
@@ -99,6 +100,85 @@ static void hqx_layer_close(munbox_layer_t *self);
 
 // Handle open(FIRST/NEXT) for the BinHex layer and return fork info
 static int hqx_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_info_t *info);
+
+// Re-parse the HQX header and reset decoding state after rewinding the source
+static int decode_one_byte(hqx_layer_state_t *state); // forward declaration
+static int hqx_layer_reparse(hqx_layer_state_t *state) {
+    // Reset low-level decoder state
+    state->seq = 0;
+    state->rle_active = false;
+    state->last_symbol = 0;
+    state->last_output_byte = 0;
+    state->rle_count = 0;
+    state->stream_state = HQX_STATE_HEADER;
+    state->header_crc = 0;
+    state->data_crc = 0;
+    state->rsrc_crc = 0;
+    state->data_rem = 0;
+    state->rsrc_rem = 0;
+    state->iterating = false; // caller will set as needed
+    state->opened = false;
+    state->ever_read = false;
+
+    // 1. Scan forward until ':' (start of encoded data)
+    uint8_t c;
+    bool found_colon = false;
+    while (state->source->read(state->source, &c, 1) == 1) {
+        if (c == ':') {
+            found_colon = true;
+            break;
+        }
+    }
+    if (!found_colon) {
+        return munbox_error("hqx rewind: no ':' marker found");
+    }
+
+    // 2. Decode header exactly as during initial construction
+    int res = decode_one_byte(state);
+    if (res < 0)
+        return munbox_error("hqx rewind: failed to read name length");
+
+    uint8_t name_len = (uint8_t)res;
+    state->last_output_byte = name_len;
+
+    int header_data_len = name_len + 1 + 4 + 4 + 2 + 4 + 4; // filename + nul + type + creator + flags + lengths
+    uint8_t header_buf[256 + 22];
+    header_buf[0] = name_len;
+    state->header_crc = crc16_ccitt_update(0, header_buf, 1);
+
+    for (int i = 0; i < header_data_len + 2; ++i) { // +2 for CRC
+        res = decode_one_byte(state);
+        if (res < 0)
+            return munbox_error("hqx rewind: failed while reading header");
+        header_buf[i + 1] = (uint8_t)res;
+        state->last_output_byte = (uint8_t)res;
+        state->header_crc = crc16_ccitt_update(state->header_crc, &header_buf[i + 1], 1);
+    }
+    if (state->header_crc != 0)
+        return munbox_error("hqx rewind: header CRC mismatch");
+
+    // Populate metadata
+    memset(&state->file_info, 0, sizeof(munbox_file_info_t));
+    size_t name_copy_len = (name_len < sizeof(state->file_info.filename) - 1) ? name_len : sizeof(state->file_info.filename) - 1;
+    memcpy(state->file_info.filename, header_buf + 1, name_copy_len);
+    state->file_info.filename[name_copy_len] = '\0';
+
+    const uint8_t *type_ptr = header_buf + 1 + name_len + 1;
+    const uint8_t *creator_ptr = type_ptr + 4;
+    const uint8_t *flags_ptr = creator_ptr + 4;
+    state->file_info.type = (type_ptr[0] << 24) | (type_ptr[1] << 16) | (type_ptr[2] << 8) | type_ptr[3];
+    state->file_info.creator = (creator_ptr[0] << 24) | (creator_ptr[1] << 16) | (creator_ptr[2] << 8) | creator_ptr[3];
+    state->file_info.finder_flags = (flags_ptr[0] << 8) | flags_ptr[1];
+
+    const uint8_t *p = header_buf + 1 + name_len + 1 + 4 + 4 + 2;
+    state->data_rem = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+    p += 4;
+    state->rsrc_rem = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+    state->file_info.has_metadata = true;
+
+    state->stream_state = (state->data_rem > 0) ? HQX_STATE_DATA : HQX_STATE_RSRC;
+    return 0;
+}
 
 // Read the next non-whitespace encoded character from the source stream
 static int get_next_encoded_char(hqx_layer_state_t *state) {
@@ -237,6 +317,7 @@ static ssize_t hqx_layer_read(munbox_layer_t *self, void *buf, size_t cnt) {
             state->data_crc = crc16_ccitt_update(state->data_crc, &out_buf[bytes_written], 1);
             bytes_written++;
             state->data_rem--;
+            state->ever_read = true;
 
         } else if (state->stream_state == HQX_STATE_RSRC) {
             if (state->rsrc_rem == 0) {
@@ -268,6 +349,7 @@ static ssize_t hqx_layer_read(munbox_layer_t *self, void *buf, size_t cnt) {
             state->rsrc_crc = crc16_ccitt_update(state->rsrc_crc, &out_buf[bytes_written], 1);
             bytes_written++;
             state->rsrc_rem--;
+            state->ever_read = true;
 
         } else {
             // Should not happen if initialized correctly
@@ -445,30 +527,38 @@ static int hqx_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
         return munbox_error("Invalid parameters to hqx_layer_open");
     hqx_layer_state_t *state = (hqx_layer_state_t *)self->internal_state;
 
-    // The HQX decoding is a single pass; we can't rewind. open(FIRST) must be called
-    // before any read() if iteration is desired.
     state->iterating = true;
-    state->opened = true;
 
     if (what == MUNBOX_OPEN_FIRST) {
-        if (state->stream_state != HQX_STATE_DATA && state->stream_state != HQX_STATE_RSRC) {
-            return munbox_error("cannot start iteration at this point");
+        // If we've already read some bytes, attempt a rewind + reparse
+        if (state->ever_read) {
+            if (!state->source->open)
+                return munbox_error("underlying source cannot rewind for HQX FIRST");
+            munbox_file_info_t dummy;
+            if (state->source->open(state->source, MUNBOX_OPEN_FIRST, &dummy) < 0)
+                return munbox_error("failed to rewind underlying source for HQX FIRST");
+            if (hqx_layer_reparse(state) < 0)
+                return MUNBOX_ERROR; // error already reported
         }
-        // Begin at data fork if present; otherwise resource fork
+        state->opened = true;
+        // After (optional) reparse, present first available fork
+        if (state->stream_state != HQX_STATE_DATA && state->stream_state != HQX_STATE_RSRC)
+            return munbox_error("cannot start iteration at this point");
+
         if (state->data_rem > 0) {
             *info = state->file_info;
             info->fork_type = MUNBOX_FORK_DATA;
             info->length = (uint32_t)state->data_rem;
             return 1;
-        } else if (state->rsrc_rem > 0) {
-            state->stream_state = HQX_STATE_RSRC; // ensure we are in rsrc state
+        }
+        if (state->rsrc_rem > 0) {
+            state->stream_state = HQX_STATE_RSRC;
             *info = state->file_info;
             info->fork_type = MUNBOX_FORK_RESOURCE;
             info->length = (uint32_t)state->rsrc_rem;
             return 1;
-        } else {
-            return 0;
         }
+        return 0; // nothing
     } else { // NEXT
         // If currently in DATA and resource exists, fast-forward to start of resource fork
         if (state->stream_state == HQX_STATE_DATA && state->rsrc_rem > 0) {
@@ -481,6 +571,7 @@ static int hqx_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
                 state->last_output_byte = b;
                 state->data_crc = crc16_ccitt_update(state->data_crc, &b, 1);
                 state->data_rem--;
+                state->ever_read = true;
             }
             // Read and validate data CRC (2 bytes)
             uint8_t crc_bytes[2];
@@ -489,6 +580,7 @@ static int hqx_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
                 if (byte < 0)
                     return munbox_error("failed to read data fork CRC while advancing");
                 crc_bytes[i] = (uint8_t)byte;
+                state->ever_read = true;
             }
             state->data_crc = crc16_ccitt_update(state->data_crc, crc_bytes, 2);
             if (state->data_crc != 0)
