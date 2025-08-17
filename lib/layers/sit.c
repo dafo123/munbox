@@ -33,7 +33,8 @@
 
 // Local helper: safely join parent path and name into destination buffer (always NUL terminates).
 static void sit_join_path(char *dst, size_t dst_cap, const char *parent, const char *name) {
-    if (!dst_cap) return;
+    if (!dst_cap)
+        return;
     dst[0] = '\0';
     if (parent && parent[0]) {
         size_t pos = 0;
@@ -48,7 +49,8 @@ static void sit_join_path(char *dst, size_t dst_cap, const char *parent, const c
         if (name && pos < dst_cap - 1) {
             size_t rem = dst_cap - 1 - pos;
             size_t ln = strnlen(name, rem);
-            if (ln) memcpy(dst + pos, name, ln);
+            if (ln)
+                memcpy(dst + pos, name, ln);
             pos += ln;
         }
         dst[pos < dst_cap ? pos : (dst_cap - 1)] = '\0';
@@ -253,112 +255,143 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
     if (!input)
         return NULL;
 
-    bool is_classic_sit = false;
-    bool is_sit5 = false;
-
-    // Read each fork fully into memory and search for a SIT header anywhere in the fork
-    // (SEA payloads often embed the archive at a non-zero offset). If found, trim the
-    // prefix and keep only the archive bytes for extraction.
-    uint8_t *archive_data = NULL;
-    size_t archive_size = 0;
-    size_t archive_capacity = 0;
-
     if (input->open == NULL)
         return NULL;
+
+    bool is_classic_sit = false;
+    bool is_sit5 = false;
+    uint8_t *archive_data = NULL;
+    size_t archive_size = 0;
+
+    size_t have;
+    uint8_t hdr80[80];
+    size_t match_off;
+    ssize_t r;
 
     munbox_file_info_t info;
     int rc = input->open(input, MUNBOX_OPEN_FIRST, &info);
     while (rc == 1) {
-        // Read the entire current fork into a temporary buffer
-        size_t fork_cap = 1024 * 1024; // 1 MiB to start
-        uint8_t *fork_buf = (uint8_t *)malloc(fork_cap);
-        if (!fork_buf) {
-            munbox_error("Out of memory");
-            return NULL;
+        if (sit_debug_enabled()) {
+            fprintf(stderr, "[SIT] scanning fork: filename='%s' length=%lld\n", info.filename, (long long)info.length);
         }
-        size_t fork_size = 0;
-        ssize_t bytes_read;
-        while ((bytes_read = input->read(input, fork_buf + fork_size, fork_cap - fork_size)) > 0) {
-            fork_size += (size_t)bytes_read;
-            if (fork_size == fork_cap) {
-                size_t new_cap = fork_cap * 2;
-                uint8_t *tmp = (uint8_t *)realloc(fork_buf, new_cap);
-                if (!tmp) {
-                    free(fork_buf);
-                    munbox_error("Out of memory");
-                    return NULL;
-                }
-                fork_buf = tmp;
-                fork_cap = new_cap;
+        /* First, try to read only the minimum (14 bytes) to detect classic SIT at offset 0.
+         * Do this even when info.length == 0 (unknown length) by reading until we have 14
+         * bytes or hit EOF. */
+        have = 0;
+        size_t want14 = 14;
+        if ((size_t)info.length > 0 && (size_t)info.length < want14)
+            want14 = (size_t)info.length;
+        while (have < want14) {
+            r = input->read(input, hdr80 + have, want14 - have);
+            if (r <= 0) {
+                if (sit_debug_enabled())
+                    fprintf(stderr, "[SIT] read returned %zd while filling 14-byte header\n", r);
+                break;
             }
-        }
-        if (bytes_read < 0) {
-            free(fork_buf);
-            return NULL;
+            have += (size_t)r;
         }
 
-        // Fork scanned for SIT header
-
-        // Search for SIT5 magic anywhere in the fork
-        size_t match_off = (size_t)-1;
+        match_off = (size_t)-1;
         bool match_is_sit5 = false;
-        if (fork_size >= 80) {
-            for (size_t i = 0; i + 80 <= fork_size; ++i) {
-                if (memcmp(fork_buf + i, "StuffIt (c)1997-", 16) == 0 && i + 78 < fork_size &&
-                    memcmp(fork_buf + i + 20, " Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/", 58) == 0) {
+
+        if (have >= 14) {
+            const char *magic1[] = {"SIT!", "ST46", "ST50", "ST60", "ST65", "STin", "STi2", "STi3", "STi4"};
+            size_t i = 0; /* only check offset 0 */
+            for (int m = 0; m < 9; ++m) {
+                if (memcmp(hdr80 + i, magic1[m], 4) == 0 && memcmp(hdr80 + i + 10, "rLau", 4) == 0) {
                     match_off = i;
-                    match_is_sit5 = true;
+                    match_is_sit5 = false;
+                    if (sit_debug_enabled())
+                        printf("Detected classic SIT format at offset %zu\n", match_off);
                     break;
                 }
             }
         }
-        // If not SIT5, search for classic header anywhere (needs 14 bytes window)
-        if (match_off == (size_t)-1 && fork_size >= 14) {
-            const char *magic1[] = {"SIT!", "ST46", "ST50", "ST60", "ST65", "STin", "STi2", "STi3", "STi4"};
-            for (size_t i = 0; i + 14 <= fork_size; ++i) {
-                for (int m = 0; m < 9; ++m) {
-                    if (memcmp(fork_buf + i, magic1[m], 4) == 0 && memcmp(fork_buf + i + 10, "rLau", 4) == 0) {
-                        match_off = i;
-                        match_is_sit5 = false;
+
+        /* If classic not found, try reading up to 80 bytes total and test SIT5 at offset 0. */
+        if (match_off == (size_t)-1) {
+            size_t want80 = 80;
+            if ((size_t)info.length > 0 && (size_t)info.length < want80)
+                want80 = (size_t)info.length;
+            if (have < want80) {
+                while (have < want80) {
+                    r = input->read(input, hdr80 + have, want80 - have);
+                    if (r <= 0) {
+                        if (sit_debug_enabled())
+                            fprintf(stderr, "[SIT] read returned %zd while filling 80-byte header\n", r);
                         break;
                     }
+                    have += (size_t)r;
                 }
-                if (match_off != (size_t)-1)
-                    break;
+            }
+            if (have >= 80) {
+                size_t i = 0;
+                if (memcmp(hdr80 + i, "StuffIt (c)1997-", 16) == 0 && i + 78 < have &&
+                    memcmp(hdr80 + i + 20, " Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/", 58) == 0) {
+                    match_off = i;
+                    match_is_sit5 = true;
+                    if (sit_debug_enabled())
+                        printf("Detected SIT5 format at offset %zu\n", match_off);
+                }
             }
         }
 
         if (match_off != (size_t)-1) {
-            // Found a match in this fork; keep only the archive bytes starting at match
+            /* We found a signature at offset 0. If info.length is known, allocate exact size
+             * and read the remainder; otherwise, read until EOF into a growing buffer. */
+
             is_sit5 = match_is_sit5;
             is_classic_sit = !match_is_sit5;
-            archive_size = fork_size - match_off;
-            archive_capacity = archive_size;
-            archive_data = (uint8_t *)malloc(archive_capacity);
-            if (!archive_data) {
-                free(fork_buf);
-                munbox_error("Out of memory");
-                return NULL;
-            }
-            memcpy(archive_data, fork_buf + match_off, archive_size);
-            free(fork_buf);
-            break; // Done, we have the archive
+            break; /* got the archive */
         }
 
-        // Not a match in this fork; free and move to next fork
-        free(fork_buf);
+        /* No match in this fork; do not read the remainder. Move to next fork. */
         rc = input->open(input, MUNBOX_OPEN_NEXT, &info);
     }
 
     if (!is_classic_sit && !is_sit5) {
+        free(archive_data);
         return NULL;
-        // Fallback without peek: restart from beginning, read a small header, then full stream if needed
     }
 
-    // Create layer
+    /* Unknown total length: accumulate into a growing buffer until EOF. */
+    size_t cap = have ? have * 2 : 4096;
+    archive_data = (uint8_t *)malloc(cap);
+    if (!archive_data) {
+        munbox_error("Out of memory");
+        return NULL;
+    }
+    /* copy what we have */
+    if (have)
+        memcpy(archive_data, hdr80 + match_off, have);
+    size_t pos = have;
+    /* read until EOF */
+    for (;;) {
+        r = input->read(input, archive_data + pos, cap - pos);
+        if (r < 0) {
+            free(archive_data);
+            return NULL;
+        }
+        if (r == 0)
+            break;
+        pos += (size_t)r;
+        if (pos == cap) {
+            size_t ncap = cap * 2;
+            uint8_t *tmp = (uint8_t *)realloc(archive_data, ncap);
+            if (!tmp) {
+                free(archive_data);
+                munbox_error("Out of memory");
+                return NULL;
+            }
+            archive_data = tmp;
+            cap = ncap;
+        }
+    }
+    archive_size = pos;
+
+    /* Create layer and state */
     munbox_layer_t *layer = malloc(sizeof(munbox_layer_t));
     sit_layer_state_t *state = calloc(1, sizeof(sit_layer_state_t));
-
     if (!layer || !state) {
         free(layer);
         free(state);
@@ -376,8 +409,6 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
     layer->read = NULL; // will be enabled after we build index and open()
     layer->close = sit_layer_close;
     layer->open = sit_layer_open;
-    // no extract; use open/read
-
     return layer;
 }
 
@@ -455,7 +486,8 @@ static int sit_build_index_classic(sit_layer_state_t *st) {
                 if (pos + seglen + 1 >= sizeof(full_filename)) { // +1 for '/' or '\0'
                     break; // truncate path safely
                 }
-                memcpy(full_filename + pos, seg, seglen); pos += seglen;
+                memcpy(full_filename + pos, seg, seglen);
+                pos += seglen;
                 if (d < folder_depth - 1) {
                     full_filename[pos++] = '/';
                 }
@@ -654,8 +686,8 @@ static int sit_build_index_sit5(sit_layer_state_t *st) {
                 }
             }
         }
-    char full_filename[512];
-    sit_join_path(full_filename, sizeof(full_filename), parent_path, (const char *)namebuf);
+        char full_filename[512];
+        sit_join_path(full_filename, sizeof(full_filename), parent_path, (const char *)namebuf);
 
         uint8_t *comp_rsrc = datastart_ptr;
         uint8_t *comp_data = datastart_ptr + (hasresource ? resourcecomplen : 0);
@@ -998,6 +1030,10 @@ static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
             return r;
         if (st->entry_count == 0)
             return 0;
+        if (sit_debug_enabled()) {
+            fprintf(stderr, "[SIT] index built: %zu entries, first='%s'\n", st->entry_count,
+                    st->entry_count ? st->entries[0].path : "");
+        }
         self->read = sit_layer_read;
         /* get_file_info removed; metadata available via open() */
         // debug
