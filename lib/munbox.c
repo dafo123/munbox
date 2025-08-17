@@ -215,6 +215,7 @@ munbox_layer_t *munbox_new_mem_layer(const void *buffer, size_t size) {
 // The static list of all known format handlers.
 static const munbox_format_handler_t g_format_handlers[] = {
     {"sit", munbox_new_sit_layer},
+    {"sit5", munbox_new_sit5_layer},
     {"hqx", munbox_new_hqx_layer},
     {"bin", munbox_new_bin_layer},
     //{"MacBinary Layer", munbox_new_bin_layer},

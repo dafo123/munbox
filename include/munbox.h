@@ -135,6 +135,7 @@ munbox_layer_t *munbox_new_file_layer(const char *path);
 
 munbox_layer_t *munbox_new_hqx_layer(munbox_layer_t *input);
 munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input);
+munbox_layer_t *munbox_new_sit5_layer(munbox_layer_t *input);
 munbox_layer_t *munbox_new_cpt_layer(munbox_layer_t *input);
 munbox_layer_t *munbox_new_bin_layer(munbox_layer_t *input);
 
