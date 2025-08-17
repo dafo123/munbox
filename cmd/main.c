@@ -540,387 +540,105 @@ static int cli_end_file(void *user_data) {
 
 // --- Main Processing Logic ---
 
-static int process_file(const char *filepath) {
+static int process_file_new(const char *filepath) {
     printf("Processing '%s'...\n", filepath);
 
-    // Build an input layer.
-    munbox_layer_t *current = munbox_new_file_layer(filepath);
-    if (!current) {
+    munbox_layer_t *layer = munbox_new_file_layer(filepath);
+    if (!layer) {
         fprintf(stderr, "munbox: %s\n", munbox_last_error());
         return 1;
     }
 
-    // Handler search order mirrors the core: SIT -> HQX -> BIN -> CPT
-    // We'll iteratively add transform layers (HQX/BIN) and, if SIT/CPT is recognized,
-    // delegate extraction to that archive layer. Otherwise, we will fall back to
-    // open()/read iteration to dump the final transformed stream to disk.
+    layer = munbox_process_new(layer);
+    if (!layer) {
+        fprintf(stderr, "munbox: %s\n", munbox_last_error());
+        return 1;
+    }
 
-    bool restarted;
-    do {
-        restarted = false;
-
-        // Try SIT (archive): iterate with open/read instead of extract()
-        munbox_layer_t *maybe = munbox_new_sit_layer(current);
-        if (maybe) {
-            int status = 0;
-            if (maybe->open) {
-                void *user_data = NULL;
-                char current_name[256] = "";
-                bool have_open_file = false;
-                munbox_file_info_t info;
-                int orc = maybe->open(maybe, MUNBOX_OPEN_FIRST, &info);
-                if (g_cli_options->verbose) {
-                    printf("[SIT] open(FIRST) rc=%d, read=%s\n", orc, maybe->read ? "set" : "NULL");
-                }
-                if (orc < 0) {
-                    status = 1;
-                }
-                if (orc == 1 && !maybe->read) {
-                    if (g_cli_options->verbose)
-                        printf("[SIT] read not set after open()\n");
-                    status = 1;
-                }
-                while (orc == 1 && status == 0) {
-                    // Start a new output file if filename changed
-                    if (!have_open_file || strcmp(current_name, info.filename) != 0) {
-                        if (have_open_file) {
-                            if (cli_end_file(user_data) != 0) {
-                                status = 1;
-                                break;
-                            }
-                            have_open_file = false;
-                            user_data = NULL;
-                        }
-                        if (cli_new_file(info.filename, &info, &user_data) != 0) {
-                            status = 1;
-                            break;
-                        }
-                        strncpy(current_name, info.filename, sizeof(current_name) - 1);
-                        current_name[sizeof(current_name) - 1] = '\0';
-                        have_open_file = true;
-                    }
-
-                    // Read entire current fork and write it
-                    uint8_t *buf = NULL;
-                    size_t size = 0, cap = 0;
-                    for (;;) {
-                        if (cap - size < 64 * 1024) {
-                            size_t new_cap = cap ? cap * 2 : 64 * 1024;
-                            uint8_t *nb = (uint8_t *)realloc(buf, new_cap);
-                            if (!nb) {
-                                free(buf);
-                                status = 1;
-                                break;
-                            }
-                            buf = nb;
-                            cap = new_cap;
-                        }
-                        ssize_t n = maybe->read(maybe, buf + size, cap - size);
-                        if (n < 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                        if (n == 0)
-                            break;
-                        size += (size_t)n;
-                    }
-                    if (status != 0)
-                        break;
-
-                    // Refresh info (fork_type) if available
-                    munbox_file_info_t finfo = info;
-                    if (finfo.fork_type == (int)MUNBOX_FORK_RESOURCE) {
-                        if (cli_write_resource_fork(user_data, buf, size) != 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                    } else {
-                        if (size && cli_write_data(user_data, buf, size) != 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                    }
-                    free(buf);
-
-                    // Next fork/file
-                    orc = maybe->open(maybe, MUNBOX_OPEN_NEXT, &info);
-                    if (g_cli_options->verbose) {
-                        printf("[SIT] open(NEXT) rc=%d\n", orc);
-                    }
-                }
-                if (status == 0 && have_open_file) {
-                    if (cli_end_file(user_data) != 0)
-                        status = 1;
-                }
-            } else {
-                status = 1;
-            }
-            maybe->close(maybe);
-            if (status != 0) {
-                fprintf(stderr, "munbox: extraction failed for '%s': %s\n", filepath, munbox_last_error());
-                return 1;
-            }
-            printf("Successfully extracted '%s'.\n", filepath);
-            return 0;
-        }
-
-        // Try HQX (transform)
-        maybe = munbox_new_hqx_layer(current);
-        if (maybe && maybe->read) {
-            current = maybe;
-            restarted = true;
-            continue;
-        }
-
-        // Try BIN (transform)
-        maybe = munbox_new_bin_layer(current);
-        if (maybe && maybe->read) {
-            current = maybe;
-            restarted = true;
-            continue;
-        }
-
-        // Try CPT (archive): iterate with open/read instead of extract()
-        maybe = munbox_new_cpt_layer(current);
-        if (maybe) {
-            int status = 0;
-            if (maybe->open) {
-                void *user_data = NULL;
-                char current_name[256] = "";
-                bool have_open_file = false;
-                munbox_file_info_t info;
-                int orc = maybe->open(maybe, MUNBOX_OPEN_FIRST, &info);
-                if (g_cli_options->verbose) {
-                    printf("[CPT] open(FIRST) rc=%d, read=%s\n", orc, maybe->read ? "set" : "NULL");
-                }
-                if (orc < 0) {
-                    status = 1;
-                }
-                if (orc == 1 && !maybe->read) {
-                    if (g_cli_options->verbose)
-                        printf("[CPT] read not set after open()\n");
-                    status = 1;
-                }
-                while (orc == 1 && status == 0) {
-                    if (!have_open_file || strcmp(current_name, info.filename) != 0) {
-                        if (have_open_file) {
-                            if (cli_end_file(user_data) != 0) {
-                                status = 1;
-                                break;
-                            }
-                            have_open_file = false;
-                            user_data = NULL;
-                        }
-                        if (cli_new_file(info.filename, &info, &user_data) != 0) {
-                            status = 1;
-                            break;
-                        }
-                        strncpy(current_name, info.filename, sizeof(current_name) - 1);
-                        current_name[sizeof(current_name) - 1] = '\0';
-                        have_open_file = true;
-                    }
-
-                    uint8_t *buf = NULL;
-                    size_t size = 0, cap = 0;
-                    for (;;) {
-                        if (cap - size < 64 * 1024) {
-                            size_t new_cap = cap ? cap * 2 : 64 * 1024;
-                            uint8_t *nb = (uint8_t *)realloc(buf, new_cap);
-                            if (!nb) {
-                                free(buf);
-                                status = 1;
-                                break;
-                            }
-                            buf = nb;
-                            cap = new_cap;
-                        }
-                        ssize_t n = maybe->read(maybe, buf + size, cap - size);
-                        if (n < 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                        if (n == 0)
-                            break;
-                        size += (size_t)n;
-                    }
-                    if (status != 0)
-                        break;
-
-                    munbox_file_info_t finfo = info;
-                    if (finfo.fork_type == (int)MUNBOX_FORK_RESOURCE) {
-                        if (cli_write_resource_fork(user_data, buf, size) != 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                    } else {
-                        if (size && cli_write_data(user_data, buf, size) != 0) {
-                            free(buf);
-                            status = 1;
-                            break;
-                        }
-                    }
-                    free(buf);
-
-                    orc = maybe->open(maybe, MUNBOX_OPEN_NEXT, &info);
-                    if (g_cli_options->verbose) {
-                        printf("[CPT] open(NEXT) rc=%d\n", orc);
-                    }
-                }
-                if (status == 0 && have_open_file) {
-                    if (cli_end_file(user_data) != 0)
-                        status = 1;
-                }
-            } else {
-                status = 1;
-            }
-            maybe->close(maybe);
-            if (status != 0) {
-                fprintf(stderr, "munbox: extraction failed for '%s': %s\n", filepath, munbox_last_error());
-                return 1;
-            }
-            printf("Successfully extracted '%s'.\n", filepath);
-            return 0;
-        }
-    } while (restarted);
-
-    // Fallback: No archive layer recognized. Use open()/read iteration if available
-    // to dump forks in a fork-aware way; otherwise, stream bytes to a single file.
-
-    const char *out_name = "untitled";
-
-    void *user_data = NULL;
-    munbox_file_info_t first_info;
-    bool used_open = false;
-    if (current->open) {
-        int rc = current->open(current, MUNBOX_OPEN_FIRST, &first_info);
+    // If the final layer exposes open()/read() we iterate forks/files; else stream raw.
+    if (layer->open) {
+        munbox_file_info_t info;
+        int rc = layer->open(layer, MUNBOX_OPEN_FIRST, &info);
         if (rc < 0) {
-            current->close(current);
             fprintf(stderr, "munbox: %s\n", munbox_last_error());
+            layer->close(layer);
             return 1;
         }
-        if (rc == 1) {
-            // Use the filename from first fork if present
-            if (first_info.filename[0])
-                out_name = first_info.filename;
-            // Create destination
-            if (cli_new_file(out_name, &first_info, &user_data) != 0) {
-                current->close(current);
-                return 1;
-            }
 
-            // Iterate forks and write appropriately
-            used_open = true;
-            for (;;) {
-                // Read entire current fork
-                uint8_t *buf = NULL;
-                size_t size = 0, cap = 0;
-                for (;;) {
-                    if (cap - size < 64 * 1024) {
-                        size_t new_cap = cap ? cap * 2 : 64 * 1024;
-                        uint8_t *nb = (uint8_t *)realloc(buf, new_cap);
-                        if (!nb) {
-                            free(buf);
-                            current->close(current);
-                            cli_end_file(user_data);
-                            fprintf(stderr, "munbox: out of memory\n");
-                            return 1;
-                        }
-                        buf = nb;
-                        cap = new_cap;
-                    }
-                    ssize_t n = current->read(current, buf + size, cap - size);
-                    if (n < 0) {
-                        free(buf);
-                        current->close(current);
-                        cli_end_file(user_data);
-                        fprintf(stderr, "munbox: %s\n", munbox_last_error());
+        void *user_data = NULL;
+        char current_name[256] = "";
+        bool have_open_file = false;
+
+        while (rc == 1) {
+            if (!have_open_file || strcmp(current_name, info.filename) != 0) {
+                if (have_open_file) {
+                    if (cli_end_file(user_data) != 0) {
+                        layer->close(layer);
                         return 1;
                     }
-                    if (n == 0)
-                        break;
-                    size += (size_t)n;
+                    have_open_file = false;
+                    user_data = NULL;
                 }
 
-                // Dispatch based on fork type
-                munbox_file_info_t cur_info = first_info;
-                if (cur_info.fork_type == (int)MUNBOX_FORK_RESOURCE) {
-                    // Resource fork: update AppleDouble header
-                    if (cli_write_resource_fork(user_data, buf, size) != 0) {
-                        free(buf);
-                        current->close(current);
-                        cli_end_file(user_data);
-                        return 1;
-                    }
-                } else {
-                    // Data fork: stream to data file
-                    if (size) {
-                        if (cli_write_data(user_data, buf, size) != 0) {
-                            free(buf);
-                            current->close(current);
-                            cli_end_file(user_data);
-                            return 1;
-                        }
-                    }
-                }
-                free(buf);
+                printf("Opening file '%s'...\n", info.filename);
 
-                // Next fork
-                munbox_file_info_t next_info;
-                int more = current->open(current, MUNBOX_OPEN_NEXT, &next_info);
-                if (more < 0) {
-                    current->close(current);
-                    cli_end_file(user_data);
-                    fprintf(stderr, "munbox: %s\n", munbox_last_error());
+                if (cli_new_file(info.filename[0] ? info.filename : "untitled", &info, &user_data) != 0) {
+                    layer->close(layer);
                     return 1;
                 }
-                if (more == 0)
-                    break; // done
-                first_info = next_info;
+                strncpy(current_name, info.filename, sizeof(current_name) - 1);
+                current_name[sizeof(current_name) - 1] = '\0';
+                have_open_file = true;
             }
 
-            if (cli_end_file(user_data) != 0) {
-                current->close(current);
-                return 1;
+            // Read this fork completely.
+            uint8_t *buf = NULL; size_t size = 0, cap = 0;
+            for (;;) {
+                if (cap - size < 64 * 1024) {
+                    size_t new_cap = cap ? cap * 2 : 64 * 1024;
+                    void *nb = realloc(buf, new_cap);
+                    if (!nb) { free(buf); layer->close(layer); if (have_open_file) cli_end_file(user_data); fprintf(stderr, "munbox: out of memory\n"); return 1; }
+                    buf = (uint8_t*)nb; cap = new_cap;
+                }
+                ssize_t n = layer->read(layer, buf + size, cap - size);
+                if (n < 0) { free(buf); layer->close(layer); if (have_open_file) cli_end_file(user_data); fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
+                if (n == 0) break; size += (size_t)n;
             }
+            if (info.fork_type == (int)MUNBOX_FORK_RESOURCE) {
+                if (cli_write_resource_fork(user_data, buf, size) != 0) { free(buf); layer->close(layer); cli_end_file(user_data); return 1; }
+            } else {
+                if (size && cli_write_data(user_data, buf, size) != 0) { free(buf); layer->close(layer); cli_end_file(user_data); return 1; }
+            }
+            free(buf);
+
+            rc = layer->open(layer, MUNBOX_OPEN_NEXT, &info);
+            if (rc < 0) { layer->close(layer); if (have_open_file) cli_end_file(user_data); fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
         }
+        if (have_open_file) {
+            if (cli_end_file(user_data) != 0) { layer->close(layer); return 1; }
+        }
+    } else if (layer->read) {
+        // Raw stream fallback.
+        void *user_data = NULL;
+        if (cli_new_file("untitled", NULL, &user_data) != 0) { layer->close(layer); return 1; }
+        char buffer[4096]; ssize_t n;
+        while ((n = layer->read(layer, buffer, sizeof buffer)) > 0) {
+            if (cli_write_data(user_data, buffer, (size_t)n) != 0) { cli_end_file(user_data); layer->close(layer); return 1; }
+        }
+        if (n < 0) { cli_end_file(user_data); layer->close(layer); fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
+        if (cli_end_file(user_data) != 0) { layer->close(layer); return 1; }
+    } else {
+        layer->close(layer);
+        fprintf(stderr, "munbox: final layer has no open/read capability\n");
+        return 1;
     }
 
-    if (!used_open) {
-        // Single-stream fallback
-        if (cli_new_file(out_name, NULL, &user_data) != 0) {
-            current->close(current);
-            return 1;
-        }
-        char buffer[4096];
-        ssize_t n;
-        while ((n = current->read(current, buffer, sizeof buffer)) > 0) {
-            if (cli_write_data(user_data, buffer, (size_t)n) != 0) {
-                cli_end_file(user_data);
-                current->close(current);
-                return 1;
-            }
-        }
-        if (n < 0) {
-            cli_end_file(user_data);
-            current->close(current);
-            fprintf(stderr, "munbox: %s\n", munbox_last_error());
-            return 1;
-        }
-        if (cli_end_file(user_data) != 0) {
-            current->close(current);
-            return 1;
-        }
-    }
-
-    current->close(current);
+    layer->close(layer);
     printf("Successfully extracted '%s'.\n", filepath);
     return 0;
 }
+
+/* Legacy process_file() removed; unified logic lives in process_file_new(). */
 
 void print_usage(const char *prog_name) {
     printf("Usage: %s [options] <archive1> [<archive2> ...]\n", prog_name);
@@ -981,7 +699,7 @@ int main(int argc, char *argv[]) {
 
     int overall_status = 0;
     for (int i = optind; i < argc; i++) {
-        if (process_file(argv[i]) != 0) {
+    if (process_file_new(argv[i]) != 0) {
             overall_status = 1;
         }
     }

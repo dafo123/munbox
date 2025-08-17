@@ -386,6 +386,7 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
 // Build index entries for classic SIT archives by parsing per-file headers.
 // Populates st->entries with parsed file metadata and fork descriptors.
 static int sit_build_index_classic(sit_layer_state_t *st) {
+
     uint8_t *data = st->archive_data;
     if (st->archive_size < 22)
         return munbox_error("SIT: archive too small");
@@ -437,22 +438,42 @@ static int sit_build_index_classic(sit_layer_state_t *st) {
         }
 
         uint8_t name_len = header[2];
-        char filename[64];
+        char filename[128];
+        if (name_len >= sizeof(filename))
+            name_len = (uint8_t)(sizeof(filename) - 1);
         memcpy(filename, header + 3, name_len);
         filename[name_len] = '\0';
 
-        char full_filename[256];
+        // Build the full relative path (folder1/folder2/filename)
+        char full_filename[512];
+        full_filename[0] = '\0';
         if (folder_depth > 0) {
-            strcpy(full_filename, folder_stack[0]);
-            for (int d = 1; d < folder_depth; d++) {
-                strcat(full_filename, "/");
-                strcat(full_filename, folder_stack[d]);
+            size_t pos = 0;
+            for (int d = 0; d < folder_depth; d++) {
+                const char *seg = folder_stack[d];
+                size_t seglen = strlen(seg);
+                if (pos + seglen + 1 >= sizeof(full_filename)) { // +1 for '/' or '\0'
+                    break; // truncate path safely
+                }
+                memcpy(full_filename + pos, seg, seglen); pos += seglen;
+                if (d < folder_depth - 1) {
+                    full_filename[pos++] = '/';
+                }
             }
-            strcat(full_filename, "/");
-            strcat(full_filename, filename);
-        } else {
-            strncpy(full_filename, filename, sizeof(full_filename) - 1);
-            full_filename[sizeof(full_filename) - 1] = '\0';
+            if (pos < sizeof(full_filename) - 1) {
+                full_filename[pos++] = '/';
+            }
+            full_filename[pos] = '\0';
+        }
+        // Append filename (always)
+        if (filename[0]) {
+            size_t cur = strlen(full_filename);
+            size_t remain = sizeof(full_filename) - 1 - cur;
+            if (remain > 0) {
+                size_t flen = strnlen(filename, remain);
+                memcpy(full_filename + cur, filename, flen);
+                full_filename[cur + flen] = '\0';
+            }
         }
 
         uint32_t rsrc_len = LOAD_BE32(header + 84);

@@ -72,15 +72,6 @@ typedef enum { MUNBOX_OPEN_FIRST = 0, MUNBOX_OPEN_NEXT = 1 } munbox_open_t;
  */
 typedef enum { MUNBOX_FORK_DATA = 0, MUNBOX_FORK_RESOURCE = 1 } munbox_fork_t;
 
-/**
- * @brief Extended output callbacks that support resource fork data.
- */
-typedef struct munbox_extract_callbacks {
-    int (*new_file)(const char *path, const munbox_file_info_t *file_info, void **out_user_data);
-    int (*write_data)(void *user_data, const void *buf, size_t cnt);
-    int (*write_resource_fork)(void *user_data, const void *rsrc_data, size_t rsrc_size);
-    int (*end_file)(void *user_data);
-} munbox_extract_callbacks_t;
 
 /**
  * @brief Represents a single layer in the processing pipeline.
@@ -99,8 +90,6 @@ typedef struct munbox_layer {
      * is a usage error and will return MUNBOX_ERROR.
      */
     ssize_t (*read)(struct munbox_layer *self, void *buf, size_t cnt);
-
-    /* Removed: peek() no longer used; identification uses open(FIRST)+read */
 
     /** Required: Release resources owned by this layer. */
     void (*close)(struct munbox_layer *self);
@@ -137,14 +126,7 @@ int munbox_error(const char *fmt, ...)
 
 /* --- Main Processing Function --- */
 
-/**
- * @brief Processes a stream with extended callbacks that support resource forks.
- *
- * @param initial_layer The starting layer to process (e.g., from a file or memory).
- * @param callbacks The extended callbacks including resource fork support.
- * @return 0 on success, MUNBOX_ERROR on failure, or MUNBOX_ABORT if a callback aborted.
- */
-int munbox_process(munbox_layer_t *initial_layer, const munbox_extract_callbacks_t *callbacks);
+munbox_layer_t *munbox_process_new(munbox_layer_t *initial_layer);
 
 /* --- Individual Format Handlers (for manual chaining if needed) --- */
 
