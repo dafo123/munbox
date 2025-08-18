@@ -38,7 +38,7 @@ preserved). Bytes 15–21: seven unknown bytes (treated as opaque). Everything i
 | Offset | Size | Field | Notes |
 | ------ | ---- | ----- | ----- |
 | 0 | 4 | magic1 | One of `SIT!` `ST46` `ST50` `ST60` `ST65` `STin` `STi2` `STi3` `STi4` |
-| 4 | 2 | file_count | Observed usage unclear (may exclude nested folder contents). Not trusted for iteration. |
+| 4 | 2 | file_count | Number of file/folder entries. Used for sequential iteration. |
 | 6 | 4 | total_size | Total archive size (may be used for validation). |
 | 10 | 4 | magic2 | Always `rLau`. |
 | 14 | 1 | version | Preserved verbatim. |
