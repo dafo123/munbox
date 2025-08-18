@@ -108,24 +108,6 @@ typedef struct sit_stream_state {
     sit13_ctx_t *sit13;
 } sit_stream_state_t;
 
-typedef struct sit5_stream_state {
-    // common
-    sit_stream_kind_t kind;
-    const uint8_t *src;
-    size_t src_len;
-    size_t src_pos;
-    size_t out_rem; // uncompressed bytes remaining to produce
-    bool skip_crc;
-    uint16_t crc_accum;
-    // rle90 state
-    uint8_t last_byte;
-    size_t rep_rem; // remaining repeat count for last_byte
-    // LZW state (method 2)
-    struct lzw_ctx *lzw;
-    // SIT13 state
-    sit13_ctx_t *sit13;
-} sit5_stream_state_t;
-
 typedef struct {
     // Descriptor for a fork: uncompressed/comp lengths, crc, method and pointer
     uint32_t uncomp_len;
@@ -135,30 +117,40 @@ typedef struct {
     const uint8_t *comp_ptr; // points into archive_data
 } sit_fork_desc_t;
 
-// Index entry describing a single file (path, metadata, and fork descriptors)
-typedef struct {
-    char path[512];
-    uint32_t type;
-    uint32_t creator;
-    uint16_t finder_flags;
-    sit_fork_desc_t data;
-    sit_fork_desc_t rsrc;
-} sit_index_entry_t;
-
 typedef struct {
     munbox_layer_t *source;
     uint8_t *archive_data;
     size_t archive_size;
+    bool is_sit5;
 
-    // Sequential reading state for classic SIT
-    uint32_t current_offset;     // Current position in archive for next entry header
-    uint32_t num_files;          // Number of files from archive header
-    uint32_t files_processed;    // How many files we've processed so far
+    union {
+        struct {
+            // Sequential reading state for classic SIT
+            uint32_t current_offset;     // Current position in archive for next entry header
+            uint32_t num_files;          // Number of files from archive header
+            uint32_t files_processed;    // How many files we've processed so far
+            
+            // Directory tracking for path building (stack-based)
+            char folder_stack[10][256];  // Classic SIT has simpler folder structure
+            int folder_depth;
+        } classic;
+        struct {
+            // Sequential reading state for SIT5
+            uint32_t current_cursor;    // Current position in archive for next entry
+            uint32_t initial_cursor;    // Starting cursor from archive header
+            uint32_t entries_remaining; // Number of entries left to process
+            
+            // Directory tracking for path building (stack-based)
+            struct {
+                uint32_t offset;
+                char path[512];
+                uint32_t parent_offset; // To detect when we exit this directory
+            } dir_stack[32];
+            int dir_stack_depth;
+        } sit5;
+    } format_state;
+
     bool first_open_called;      // Track if first open was called
-    
-    // Directory tracking for path building (stack-based)
-    char folder_stack[10][256];  // Classic SIT has simpler folder structure
-    int folder_depth;
 
     // Current file state
     int iter_fork; // 0=data, 1=rsrc
@@ -178,44 +170,6 @@ typedef struct {
     struct lzw_ctx *lzw_ctx; // LZW streaming context, if used
     bool opened; // require open() before read()
 } sit_layer_state_t;
-
-typedef struct {
-    munbox_layer_t *source;
-    uint8_t *archive_data;
-    size_t archive_size;
-
-    // Sequential reading state for SIT5
-    uint32_t current_cursor;    // Current position in archive for next entry
-    uint32_t initial_cursor;    // Starting cursor from archive header
-    uint32_t entries_remaining; // Number of entries left to process
-    bool first_open_called;     // Track if first open was called
-    
-    // Directory tracking for path building (stack-based)
-    struct {
-        uint32_t offset;
-        char path[512];
-        uint32_t parent_offset; // To detect when we exit this directory
-    } dir_stack[32];
-    int dir_stack_depth;
-
-    // Current file state
-    int iter_fork; // 0=data, 1=rsrc
-    munbox_file_info_t cur_info;
-    
-    // Fork descriptors for current file
-    sit_fork_desc_t data_fork;
-    sit_fork_desc_t rsrc_fork;
-    bool has_rsrc_fork;
-
-    // Streaming fields
-    sit_stream_kind_t cur_stream_kind; // current mode
-    sit_stream_state_t stream; // streaming state for current fork
-    uint16_t expected_crc; // expected CRC for current fork
-    sit15_ctx_t *sit15_ctx; // SIT15 streaming context, if used
-    sit13_ctx_t *sit13_ctx; // SIT13 streaming context, if used
-    struct lzw_ctx *lzw_ctx; // LZW streaming context, if used
-    bool opened; // require open() before read()
-} sit5_layer_state_t;
 
 // Debug helper: enable verbose SIT logs if env var is set
 // Returns true if SIT debug logging is enabled via MUNBOX_DEBUG_SIT env var
@@ -238,8 +192,7 @@ static ssize_t sit_layer_read(munbox_layer_t *self, void *buf, size_t cnt);
 
 // Forward declarations for vtable wiring: open/read implementations
 static int sit5_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_info_t *info);
-// Read uncompressed bytes from the current fork
-static ssize_t sit5_layer_read(munbox_layer_t *self, void *buf, size_t cnt);
+
 
 
 // --- CRC Calculation ---
@@ -315,53 +268,60 @@ static void sit_layer_close(munbox_layer_t *self) {
     free(self);
 }
 
-static void sit5_layer_close(munbox_layer_t *self) {
-    if (!self)
-        return;
-    sit5_layer_state_t *state = (sit5_layer_state_t *)self->internal_state;
-    if (state) {
-        if (state->source)
-            state->source->close(state->source);
-        free(state->archive_data);
-        if (state->sit15_ctx) {
-            sit15_free(state->sit15_ctx);
-            state->sit15_ctx = NULL;
-        }
-        if (state->sit13_ctx) {
-            sit13_free(state->sit13_ctx);
-            state->sit13_ctx = NULL;
-        }
-        if (state->lzw_ctx) {
-            lzw_free(state->lzw_ctx);
-            state->lzw_ctx = NULL;
-        }
-        free(state);
-    }
-    free(self);
-}
-
 // --- Extended Layer Functions ---
 
 // (Legacy extraction code removed)
 
 /* static int sit_extract(munbox_layer_t *self, const munbox_extract_callbacks_t *callbacks) { return MUNBOX_ERROR; } */
 
+static bool load_archive_from_input(munbox_layer_t *input, uint8_t **archive_data, size_t *archive_size, const uint8_t *hdr, size_t hdr_len) {
+    size_t cap = hdr_len ? hdr_len * 2 : 4096;
+    *archive_data = (uint8_t *)malloc(cap);
+    if (!*archive_data) {
+        munbox_error("Out of memory");
+        return false;
+    }
+    if (hdr_len) {
+        memcpy(*archive_data, hdr, hdr_len);
+    }
+    size_t pos = hdr_len;
+    for (;;) {
+        ssize_t r = input->read(input, *archive_data + pos, cap - pos);
+        if (r < 0) {
+            free(*archive_data);
+            *archive_data = NULL;
+            return false;
+        }
+        if (r == 0)
+            break;
+        pos += (size_t)r;
+        if (pos == cap) {
+            size_t ncap = cap * 2;
+            uint8_t *tmp = (uint8_t *)realloc(*archive_data, ncap);
+            if (!tmp) {
+                free(*archive_data);
+                *archive_data = NULL;
+                munbox_error("Out of memory");
+                return false;
+            }
+            *archive_data = tmp;
+            cap = ncap;
+        }
+    }
+    *archive_size = pos;
+    return true;
+}
+
 // Create a new classic SIT layer that scans the input for an embedded classic SIT archive and
 // prepares the layer for open()/read() iteration (archive kept in memory).
 munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
-    if (!input)
+    if (!input || !input->open)
         return NULL;
 
-    if (input->open == NULL)
-        return NULL;
-
-    bool found_classic_sit = false;
     uint8_t *archive_data = NULL;
     size_t archive_size = 0;
-
-    size_t have;
     uint8_t hdr14[14];
-    ssize_t r;
+    size_t have = 0;
 
     munbox_file_info_t info;
     int rc = input->open(input, MUNBOX_OPEN_FIRST, &info);
@@ -369,11 +329,13 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
         if (sit_debug_enabled()) {
             fprintf(stderr, "[SIT] scanning fork: filename='%s' length=%lld\n", info.filename, (long long)info.length);
         }
-        /* Try to read 14 bytes to detect classic SIT at offset 0. */
+        
         have = 0;
         size_t want14 = 14;
         if ((size_t)info.length > 0 && (size_t)info.length < want14)
             want14 = (size_t)info.length;
+        
+        ssize_t r;
         while (have < want14) {
             r = input->read(input, hdr14 + have, want14 - have);
             if (r <= 0) {
@@ -388,63 +350,22 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
             const char *classic_magic[] = {"SIT!", "ST46", "ST50", "ST60", "ST65", "STin", "STi2", "STi3", "STi4"};
             for (int m = 0; m < 9; ++m) {
                 if (memcmp(hdr14, classic_magic[m], 4) == 0 && memcmp(hdr14 + 10, "rLau", 4) == 0) {
-                    found_classic_sit = true;
                     if (sit_debug_enabled())
                         printf("Detected classic SIT format\n");
-                    break;
+                    if (load_archive_from_input(input, &archive_data, &archive_size, hdr14, have)) {
+                        goto found;
+                    } else {
+                        return NULL;
+                    }
                 }
             }
         }
-
-        if (found_classic_sit) {
-            /* Found classic SIT signature. Read the entire fork. */
-            break;
-        }
-
-        /* No match in this fork; move to next fork. */
         rc = input->open(input, MUNBOX_OPEN_NEXT, &info);
     }
 
-    if (!found_classic_sit) {
-        return NULL;
-    }
+    return NULL; // Not found
 
-    /* Read the entire archive into memory */
-    size_t cap = have ? have * 2 : 4096;
-    archive_data = (uint8_t *)malloc(cap);
-    if (!archive_data) {
-        munbox_error("Out of memory");
-        return NULL;
-    }
-    /* copy what we have */
-    if (have)
-        memcpy(archive_data, hdr14, have);
-    size_t pos = have;
-    /* read until EOF */
-    for (;;) {
-        r = input->read(input, archive_data + pos, cap - pos);
-        if (r < 0) {
-            free(archive_data);
-            return NULL;
-        }
-        if (r == 0)
-            break;
-        pos += (size_t)r;
-        if (pos == cap) {
-            size_t ncap = cap * 2;
-            uint8_t *tmp = (uint8_t *)realloc(archive_data, ncap);
-            if (!tmp) {
-                free(archive_data);
-                munbox_error("Out of memory");
-                return NULL;
-            }
-            archive_data = tmp;
-            cap = ncap;
-        }
-    }
-    archive_size = pos;
-
-    /* Create layer and state */
+found:;
     munbox_layer_t *layer = malloc(sizeof(munbox_layer_t));
     sit_layer_state_t *state = calloc(1, sizeof(sit_layer_state_t));
     if (!layer || !state) {
@@ -458,18 +379,18 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
     state->source = input;
     state->archive_data = archive_data;
     state->archive_size = archive_size;
+    state->is_sit5 = false;
     
-    // Initialize sequential reading state for classic SIT
     if (archive_size >= 22) {
-        state->num_files = LOAD_BE16(archive_data + 4); // File count is 16-bit at offset 4
+        state->format_state.classic.num_files = LOAD_BE16(archive_data + 4);
     }
-    state->current_offset = 22; // Start right after archive header
-    state->files_processed = 0;
+    state->format_state.classic.current_offset = 22;
+    state->format_state.classic.files_processed = 0;
     state->first_open_called = false;
-    state->folder_depth = 0;
+    state->format_state.classic.folder_depth = 0;
 
     layer->internal_state = state;
-    layer->read = NULL; // will be enabled after we open() and find files
+    layer->read = NULL;
     layer->close = sit_layer_close;
     layer->open = sit_layer_open;
     return layer;
@@ -479,30 +400,25 @@ munbox_layer_t *munbox_new_sit_layer(munbox_layer_t *input) {
 // Create a new SIT5 layer that scans the input for an embedded SIT5 archive and
 // prepares the layer for sequential open()/read() iteration (archive kept in memory).
 munbox_layer_t *munbox_new_sit5_layer(munbox_layer_t *input) {
-    if (!input)
+    if (!input || !input->open)
         return NULL;
 
-    if (input->open == NULL)
-        return NULL;
-
-    bool found_sit5 = false;
     uint8_t *archive_data = NULL;
     size_t archive_size = 0;
-
-    size_t have;
     uint8_t hdr80[80];
-    ssize_t r;
+    size_t have = 0;
 
     munbox_file_info_t info;
     int rc = input->open(input, MUNBOX_OPEN_FIRST, &info);
     while (rc == 1) {
         printf("[SIT5] scanning fork: filename='%s' length=%lld\n", info.filename, (long long)info.length);
         
-        /* Try reading up to 80 bytes to test for SIT5 signature at offset 0. */
         have = 0;
         size_t want80 = 80;
         if ((size_t)info.length > 0 && (size_t)info.length < want80)
             want80 = (size_t)info.length;
+        
+        ssize_t r;
         while (have < want80) {
             r = input->read(input, hdr80 + have, want80 - have);
             if (r <= 0) {
@@ -516,62 +432,22 @@ munbox_layer_t *munbox_new_sit5_layer(munbox_layer_t *input) {
         if (have >= 80) {
             if (memcmp(hdr80, "StuffIt (c)1997-", 16) == 0 && 
                 memcmp(hdr80 + 20, " Aladdin Systems, Inc., http://www.aladdinsys.com/StuffIt/", 58) == 0) {
-                found_sit5 = true;
                 printf("SIT5: Detected SIT5 format\n");
+                if (load_archive_from_input(input, &archive_data, &archive_size, hdr80, have)) {
+                    goto found;
+                } else {
+                    return NULL;
+                }
             }
         }
-
-        if (found_sit5) {
-            /* Found SIT5 signature. */
-            break;
-        }
-
-        /* No match in this fork; move to next fork. */
         rc = input->open(input, MUNBOX_OPEN_NEXT, &info);
     }
 
-    if (!found_sit5) {
-        return NULL;
-    }
+    return NULL; // Not found
 
-    /* Read the entire archive into memory */
-    size_t cap = have ? have * 2 : 4096;
-    archive_data = (uint8_t *)malloc(cap);
-    if (!archive_data) {
-        munbox_error("Out of memory");
-        return NULL;
-    }
-    /* copy what we have */
-    if (have)
-        memcpy(archive_data, hdr80, have);
-    size_t pos = have;
-    /* read until EOF */
-    for (;;) {
-        r = input->read(input, archive_data + pos, cap - pos);
-        if (r < 0) {
-            free(archive_data);
-            return NULL;
-        }
-        if (r == 0)
-            break;
-        pos += (size_t)r;
-        if (pos == cap) {
-            size_t ncap = cap * 2;
-            uint8_t *tmp = (uint8_t *)realloc(archive_data, ncap);
-            if (!tmp) {
-                free(archive_data);
-                munbox_error("Out of memory");
-                return NULL;
-            }
-            archive_data = tmp;
-            cap = ncap;
-        }
-    }
-    archive_size = pos;
-
-    /* Create layer and state */
+found:;
     munbox_layer_t *layer = malloc(sizeof(munbox_layer_t));
-    sit5_layer_state_t *state = calloc(1, sizeof(sit5_layer_state_t));
+    sit_layer_state_t *state = calloc(1, sizeof(sit_layer_state_t));
     if (!layer || !state) {
         free(layer);
         free(state);
@@ -583,10 +459,11 @@ munbox_layer_t *munbox_new_sit5_layer(munbox_layer_t *input) {
     state->source = input;
     state->archive_data = archive_data;
     state->archive_size = archive_size;
+    state->is_sit5 = true;
 
     layer->internal_state = state;
-    layer->read = NULL; // will be enabled after sequential parsing starts
-    layer->close = sit5_layer_close;
+    layer->read = NULL;
+    layer->close = sit_layer_close;
     layer->open = sit5_layer_open;
     return layer;
 }
@@ -598,26 +475,16 @@ munbox_layer_t *munbox_new_sit5_layer(munbox_layer_t *input) {
 // Build index entries for classic SIT archives by parsing per-file headers.
 // --- Helper function to read next entry sequentially from classic SIT ---
 
-typedef struct {
-    char path[512];
-    uint32_t type;
-    uint32_t creator;
-    uint16_t finder_flags;
-    sit_fork_desc_t data_fork;
-    sit_fork_desc_t rsrc_fork;
-    bool has_rsrc_fork;
-} sit_entry_info_t;
-
 // Read the next file entry sequentially from classic SIT archive
-static int sit_read_next_entry(sit_layer_state_t *st, sit_entry_info_t *entry) {
-    if (st->files_processed >= st->num_files) {
+static int sit_read_next_entry(sit_layer_state_t *st) {
+    if (st->format_state.classic.files_processed >= st->format_state.classic.num_files) {
         return 0; // No more files
     }
 
     uint8_t *data = st->archive_data;
-    uint8_t *current = data + st->current_offset;
+    uint8_t *current = data + st->format_state.classic.current_offset;
 
-    while (st->files_processed < st->num_files) {
+    while (st->format_state.classic.files_processed < st->format_state.classic.num_files) {
         // Check if we have enough space for a header
         if ((size_t)(current - data) + 112 > st->archive_size) {
             // If we're at or near the end of the archive, this might be normal
@@ -631,33 +498,33 @@ static int sit_read_next_entry(sit_layer_state_t *st, sit_entry_info_t *entry) {
         // Folder start
         if (res_method == 32 || data_method == 32) {
             uint8_t name_len = header[2];
-            if (st->folder_depth < 10 && name_len < 64) {
-                memcpy(st->folder_stack[st->folder_depth], header + 3, name_len);
-                st->folder_stack[st->folder_depth][name_len] = '\0';
-                st->folder_depth++;
+            if (st->format_state.classic.folder_depth < 10 && name_len < 64) {
+                memcpy(st->format_state.classic.folder_stack[st->format_state.classic.folder_depth], header + 3, name_len);
+                st->format_state.classic.folder_stack[st->format_state.classic.folder_depth][name_len] = '\0';
+                st->format_state.classic.folder_depth++;
             }
             current = header + 112;
-            st->current_offset = current - data;
-            st->files_processed++;
+            st->format_state.classic.current_offset = current - data;
+            st->format_state.classic.files_processed++;
             continue;
         }
         
         // Folder end
         if (res_method == 33 || data_method == 33) {
-            if (st->folder_depth > 0) {
-                st->folder_depth--;
+            if (st->format_state.classic.folder_depth > 0) {
+                st->format_state.classic.folder_depth--;
             }
             current = header + 112;
-            st->current_offset = current - data;
-            st->files_processed++;
+            st->format_state.classic.current_offset = current - data;
+            st->format_state.classic.files_processed++;
             continue;
         }
         
         if ((res_method & 0xE0) || (data_method & 0xE0)) {
             // Skip unknown folder markers
             current = header + 112;
-            st->current_offset = current - data;
-            st->files_processed++;
+            st->format_state.classic.current_offset = current - data;
+            st->format_state.classic.files_processed++;
             continue;
         }
 
@@ -671,35 +538,35 @@ static int sit_read_next_entry(sit_layer_state_t *st, sit_entry_info_t *entry) {
         filename[name_len] = '\0';
 
         // Build the full relative path (folder1/folder2/filename)
-        entry->path[0] = '\0';
-        if (st->folder_depth > 0) {
+        st->cur_info.filename[0] = '\0';
+        if (st->format_state.classic.folder_depth > 0) {
             size_t pos = 0;
-            for (int d = 0; d < st->folder_depth; d++) {
-                const char *seg = st->folder_stack[d];
+            for (int d = 0; d < st->format_state.classic.folder_depth; d++) {
+                const char *seg = st->format_state.classic.folder_stack[d];
                 size_t seglen = strlen(seg);
-                if (pos + seglen + 1 >= sizeof(entry->path)) { // +1 for '/' or '\0'
+                if (pos + seglen + 1 >= sizeof(st->cur_info.filename)) { // +1 for '/' or '\0'
                     break; // truncate path safely
                 }
-                memcpy(entry->path + pos, seg, seglen);
+                memcpy(st->cur_info.filename + pos, seg, seglen);
                 pos += seglen;
-                if (d < st->folder_depth - 1) {
-                    entry->path[pos++] = '/';
+                if (d < st->format_state.classic.folder_depth - 1) {
+                    st->cur_info.filename[pos++] = '/';
                 }
             }
-            if (pos < sizeof(entry->path) - 1) {
-                entry->path[pos++] = '/';
+            if (pos < sizeof(st->cur_info.filename) - 1) {
+                st->cur_info.filename[pos++] = '/';
             }
-            entry->path[pos] = '\0';
+            st->cur_info.filename[pos] = '\0';
         }
         
         // Append filename (always)
         if (filename[0]) {
-            size_t cur = strlen(entry->path);
-            size_t remain = sizeof(entry->path) - 1 - cur;
+            size_t cur = strlen(st->cur_info.filename);
+            size_t remain = sizeof(st->cur_info.filename) - 1 - cur;
             if (remain > 0) {
                 size_t flen = strnlen(filename, remain);
-                memcpy(entry->path + cur, filename, flen);
-                entry->path[cur + flen] = '\0';
+                memcpy(st->cur_info.filename + cur, filename, flen);
+                st->cur_info.filename[cur + flen] = '\0';
             }
         }
 
@@ -711,9 +578,10 @@ static int sit_read_next_entry(sit_layer_state_t *st, sit_entry_info_t *entry) {
         uint16_t rsrc_crc = LOAD_BE16(header + 100);
         uint16_t data_crc = LOAD_BE16(header + 102);
         
-        entry->type = LOAD_BE32(header + 66);
-        entry->creator = LOAD_BE32(header + 70);
-        entry->finder_flags = LOAD_BE16(header + 74);
+        st->cur_info.type = LOAD_BE32(header + 66);
+        st->cur_info.creator = LOAD_BE32(header + 70);
+        st->cur_info.finder_flags = LOAD_BE16(header + 74);
+        st->cur_info.has_metadata = true;
 
         uint8_t *comp_rsrc = header + 112;
         uint8_t *comp_data = comp_rsrc + rsrc_comp_len;
@@ -724,24 +592,24 @@ static int sit_read_next_entry(sit_layer_state_t *st, sit_entry_info_t *entry) {
         }
 
         // Fill fork descriptors
-        entry->rsrc_fork.uncomp_len = rsrc_len;
-        entry->rsrc_fork.comp_len = rsrc_comp_len;
-        entry->rsrc_fork.crc = rsrc_crc;
-        entry->rsrc_fork.method = res_method & 0x0F;
-        entry->rsrc_fork.comp_ptr = comp_rsrc;
+        st->rsrc_fork.uncomp_len = rsrc_len;
+        st->rsrc_fork.comp_len = rsrc_comp_len;
+        st->rsrc_fork.crc = rsrc_crc;
+        st->rsrc_fork.method = res_method & 0x0F;
+        st->rsrc_fork.comp_ptr = comp_rsrc;
         
-        entry->data_fork.uncomp_len = data_len;
-        entry->data_fork.comp_len = data_comp_len;
-        entry->data_fork.crc = data_crc;
-        entry->data_fork.method = data_method & 0x0F;
-        entry->data_fork.comp_ptr = comp_data;
+        st->data_fork.uncomp_len = data_len;
+        st->data_fork.comp_len = data_comp_len;
+        st->data_fork.crc = data_crc;
+        st->data_fork.method = data_method & 0x0F;
+        st->data_fork.comp_ptr = comp_data;
         
-        entry->has_rsrc_fork = (rsrc_len > 0);
+        st->has_rsrc_fork = (rsrc_len > 0);
 
         // Update position for next call
         current = comp_data + data_comp_len;
-        st->current_offset = current - data;
-        st->files_processed++;
+        st->format_state.classic.current_offset = current - data;
+        st->format_state.classic.files_processed++;
         
         return 1; // Found a file
     }
@@ -1036,30 +904,6 @@ static ssize_t sit_layer_read(munbox_layer_t *self, void *buf, size_t cnt) {
     return n;
 }
 
-static ssize_t sit5_layer_read(munbox_layer_t *self, void *buf, size_t cnt) {
-    sit5_layer_state_t *st = (sit5_layer_state_t *)self->internal_state;
-    if (!st)
-        return MUNBOX_ERROR;
-    if (!st->opened)
-        return munbox_error("read() called before open() on sit layer");
-    // Streaming path
-    ssize_t n = sit_stream_fill(&st->stream, (uint8_t *)buf, cnt, st->sit15_ctx);
-    if (st->stream.out_rem == 0) {
-        // verify CRC if applicable
-        if (!st->stream.skip_crc) {
-            if (st->stream.crc_accum != st->expected_crc) {
-                if (sit_debug_enabled()) {
-                    fprintf(stderr, "[SIT] CRC mismatch: expected=%04x computed=%04x (file='%s', fork=%s)\n",
-                            (unsigned)st->expected_crc, (unsigned)st->stream.crc_accum, st->cur_info.filename,
-                            st->cur_info.fork_type == (int)MUNBOX_FORK_RESOURCE ? "rsrc" : "data");
-                }
-                return munbox_error("SIT fork CRC mismatch");
-            }
-        }
-    }
-    return n;
-}
-
 // Open (or advance) the current file/fork in the SIT archive and return file info.
 // Prepares per-fork streaming contexts and fills `info` with metadata.
 static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_info_t *info) {
@@ -1071,9 +915,9 @@ static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
     
     if (what == MUNBOX_OPEN_FIRST) {
         // Reset sequential reading state
-        st->current_offset = 22; // Start right after archive header
-        st->files_processed = 0;
-        st->folder_depth = 0;
+        st->format_state.classic.current_offset = 22; // Start right after archive header
+        st->format_state.classic.files_processed = 0;
+        st->format_state.classic.folder_depth = 0;
         st->iter_fork = 0; // start with data fork
         st->first_open_called = true;
         self->read = sit_layer_read;
@@ -1093,26 +937,13 @@ static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
     while (true) {
         // If we're looking for a data fork or starting a new file
         if (st->iter_fork == 0) {
-            sit_entry_info_t entry;
-            int result = sit_read_next_entry(st, &entry);
+            int result = sit_read_next_entry(st);
             if (result == 0) {
                 return 0; // No more files
             }
             if (result < 0) {
                 return result; // Error
             }
-            
-            // Store current file info
-            strncpy(st->cur_info.filename, entry.path, sizeof(st->cur_info.filename) - 1);
-            st->cur_info.filename[sizeof(st->cur_info.filename) - 1] = '\0';
-            st->cur_info.type = entry.type;
-            st->cur_info.creator = entry.creator;
-            st->cur_info.finder_flags = entry.finder_flags;
-            st->cur_info.has_metadata = true;
-            
-            st->data_fork = entry.data_fork;
-            st->rsrc_fork = entry.rsrc_fork;
-            st->has_rsrc_fork = entry.has_rsrc_fork;
         }
         
         // Determine which fork we're working with
@@ -1213,13 +1044,13 @@ static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
 // Helper function to read a single SIT5 entry header at the current cursor position
 // Returns: 1 = file entry read, 0 = end of entries, -1 = error
 // Populates the current file info and fork descriptors in the state
-static int sit5_read_next_entry(sit5_layer_state_t *st) {
-    if (st->entries_remaining == 0 || st->current_cursor == 0 || st->current_cursor >= st->archive_size) {
+static int sit5_read_next_entry(sit_layer_state_t *st) {
+    if (st->format_state.sit5.entries_remaining == 0 || st->format_state.sit5.current_cursor == 0 || st->format_state.sit5.current_cursor >= st->archive_size) {
         return 0; // end of entries
     }
 
     uint8_t *data = st->archive_data;
-    uint32_t offs = st->current_cursor;
+    uint32_t offs = st->format_state.sit5.current_cursor;
     uint8_t *header1 = data + offs;
     
     // Validate header1
@@ -1295,8 +1126,8 @@ static int sit5_read_next_entry(sit5_layer_state_t *st) {
         
         if (datalength == 0xffffffff) {
             // Special folder marker - skip
-            st->entries_remaining++;
-            st->current_cursor = header_end;
+            st->format_state.sit5.entries_remaining++;
+            st->format_state.sit5.current_cursor = header_end;
             return sit5_read_next_entry(st); // recursively try next entry
         }
         
@@ -1305,9 +1136,9 @@ static int sit5_read_next_entry(sit5_layer_state_t *st) {
         
         // Build parent path by finding the parent folder in our stack
         if (parent_offset != 0) {
-            for (int i = 0; i < st->dir_stack_depth; i++) {
-                if (st->dir_stack[i].offset == parent_offset) {
-                    strncpy(parent_path, st->dir_stack[i].path, sizeof(parent_path) - 1);
+            for (int i = 0; i < st->format_state.sit5.dir_stack_depth; i++) {
+                if (st->format_state.sit5.dir_stack[i].offset == parent_offset) {
+                    strncpy(parent_path, st->format_state.sit5.dir_stack[i].path, sizeof(parent_path) - 1);
                     parent_path[sizeof(parent_path) - 1] = '\0';
                     break;
                 }
@@ -1319,24 +1150,24 @@ static int sit5_read_next_entry(sit5_layer_state_t *st) {
         sit_join_path(folder_path, sizeof(folder_path), parent_path, namebuf);
         
         // Push this folder onto the stack
-        if (st->dir_stack_depth < 32) {
-            st->dir_stack[st->dir_stack_depth].offset = offs;
-            st->dir_stack[st->dir_stack_depth].parent_offset = parent_offset;
-            strncpy(st->dir_stack[st->dir_stack_depth].path, folder_path, 
-                   sizeof(st->dir_stack[st->dir_stack_depth].path) - 1);
-            st->dir_stack[st->dir_stack_depth].path[sizeof(st->dir_stack[st->dir_stack_depth].path) - 1] = '\0';
-            printf("SIT5: created folder '%s'\n", st->dir_stack[st->dir_stack_depth].path);
-            st->dir_stack_depth++;
+        if (st->format_state.sit5.dir_stack_depth < 32) {
+            st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].offset = offs;
+            st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].parent_offset = parent_offset;
+            strncpy(st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].path, folder_path, 
+                   sizeof(st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].path) - 1);
+            st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].path[sizeof(st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].path) - 1] = '\0';
+            printf("SIT5: created folder '%s'\n", st->format_state.sit5.dir_stack[st->format_state.sit5.dir_stack_depth].path);
+            st->format_state.sit5.dir_stack_depth++;
         }
         
-        st->entries_remaining += numfiles;
-        st->current_cursor = (uint32_t)(datastart_ptr - data);
+        st->format_state.sit5.entries_remaining += numfiles;
+        st->format_state.sit5.current_cursor = (uint32_t)(datastart_ptr - data);
         return sit5_read_next_entry(st); // recursively try next entry
     }
 
     // Handle special markers
     if (datalength == 0xffffffff) {
-        st->current_cursor = header_end;
+        st->format_state.sit5.current_cursor = header_end;
         return sit5_read_next_entry(st); // recursively try next entry
     }
 
@@ -1351,9 +1182,9 @@ static int sit5_read_next_entry(sit5_layer_state_t *st) {
     char parent_path[512] = "";
     
     if (parent_offset != 0) {
-        for (int i = 0; i < st->dir_stack_depth; i++) {
-            if (st->dir_stack[i].offset == parent_offset) {
-                strncpy(parent_path, st->dir_stack[i].path, sizeof(parent_path) - 1);
+        for (int i = 0; i < st->format_state.sit5.dir_stack_depth; i++) {
+            if (st->format_state.sit5.dir_stack[i].offset == parent_offset) {
+                strncpy(parent_path, st->format_state.sit5.dir_stack[i].path, sizeof(parent_path) - 1);
                 parent_path[sizeof(parent_path) - 1] = '\0';
                 break;
             }
@@ -1393,15 +1224,15 @@ static int sit5_read_next_entry(sit5_layer_state_t *st) {
     st->data_fork.comp_ptr = comp_data;
 
     // Advance cursor to next entry
-    st->current_cursor = (uint32_t)((comp_data - data) + datacomplen);
-    st->entries_remaining--;
+    st->format_state.sit5.current_cursor = (uint32_t)((comp_data - data) + datacomplen);
+    st->format_state.sit5.entries_remaining--;
 
     printf("SIT5: created file '%s'\n", full_filename);
     return 1; // Successfully read file entry
 }
 
 static int sit5_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_info_t *info) {
-    sit5_layer_state_t *st = (sit5_layer_state_t *)self->internal_state;
+    sit_layer_state_t *st = (sit_layer_state_t *)self->internal_state;
     if (!st || !info)
         return munbox_error("Invalid parameters to sit5_layer_open");
 
@@ -1411,21 +1242,21 @@ static int sit5_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file
         if (st->archive_size < 100)
             return munbox_error("SIT5: archive too small");
         
-        st->entries_remaining = LOAD_BE16(data + 92);
-        st->initial_cursor = LOAD_BE32(data + 94);
-        st->current_cursor = st->initial_cursor;
-        st->dir_stack_depth = 0;
+        st->format_state.sit5.entries_remaining = LOAD_BE16(data + 92);
+        st->format_state.sit5.initial_cursor = LOAD_BE32(data + 94);
+        st->format_state.sit5.current_cursor = st->format_state.sit5.initial_cursor;
+        st->format_state.sit5.dir_stack_depth = 0;
         st->first_open_called = true;
-        self->read = sit5_layer_read;
+        self->read = sit_layer_read;
     }
 
     st->opened = true;
     
     if (what == MUNBOX_OPEN_FIRST) {
         // Reset to beginning of archive
-        st->current_cursor = st->initial_cursor;
-        st->entries_remaining = LOAD_BE16(st->archive_data + 92);
-        st->dir_stack_depth = 0;
+        st->format_state.sit5.current_cursor = st->format_state.sit5.initial_cursor;
+        st->format_state.sit5.entries_remaining = LOAD_BE16(st->archive_data + 92);
+        st->format_state.sit5.dir_stack_depth = 0;
         st->iter_fork = 0; // start with data fork
         
         // Read the first file entry
