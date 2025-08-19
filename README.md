@@ -87,12 +87,78 @@ The munbox tool unpacks one or more archive files into a specified output direct
 
 ### **Library API (libmunbox)**
 
-You can use libmunbox in your own C/C++ projects to handle archive data programmatically.  
-**Example C Code:**  
-\#include \<stdio.h\>  
-\#include \<munbox.h\>
+You can embed munbox to auto‑detect and unpack nested Macintosh formats in-process. The API is intentionally tiny: create an input layer, call `munbox_process_new()` to build the decoding chain, then iterate files & forks with `open()/read()`.
 
-*TODO*
+Minimal example (error handling condensed):
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <munbox.h>
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: %s <archive>\n", argv[0]); return 1; }
+
+    munbox_layer_t *L = munbox_new_file_layer(argv[1]);
+    if (!L) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
+
+    L = munbox_process_new(L); /* Detect & chain: e.g. file.sit.hqx -> hqx -> bin -> sit */
+    if (!L) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
+
+    if (L->open) {
+        munbox_file_info_t info; int rc = L->open(L, MUNBOX_OPEN_FIRST, &info);
+        char current_name[256] = ""; FILE *out = NULL;
+        while (rc == 1) {
+            /* Start a new output file when filename changes */
+            if (strcmp(current_name, info.filename) != 0) {
+                if (out) fclose(out);
+                strncpy(current_name, info.filename, sizeof current_name - 1);
+                current_name[sizeof current_name - 1] = '\0';
+                out = fopen(current_name[0] ? current_name : "untitled", "wb");
+                if (!out) { perror("fopen"); break; }
+                if (info.has_metadata) {
+                    printf("%s (TYPE '%c%c%c%c' CREATOR '%c%c%c%c')\n", current_name,
+                           (info.type>>24)&0xFF,(info.type>>16)&0xFF,(info.type>>8)&0xFF,info.type&0xFF,
+                           (info.creator>>24)&0xFF,(info.creator>>16)&0xFF,(info.creator>>8)&0xFF,info.creator&0xFF);
+                }
+            }
+            /* Read current fork */
+            unsigned char buf[65536];
+            for (;;) {
+                ssize_t n = L->read(L, buf, sizeof buf);
+                if (n < 0) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); goto done; }
+                if (n == 0) break; /* fork finished */
+                if (info.fork_type == MUNBOX_FORK_DATA) {
+                    fwrite(buf, 1, (size_t)n, out);
+                } else {
+                    /* Resource fork bytes: store elsewhere or create AppleDouble as needed */
+                    /* (Example just discards them) */
+                }
+            }
+            rc = L->open(L, MUNBOX_OPEN_NEXT, &info);
+        }
+        if (out) fclose(out);
+    } else if (L->read) {
+        /* Single unnamed stream */
+        FILE *out = fopen("output.bin", "wb");
+        unsigned char buf[4096]; ssize_t n;
+        while ((n = L->read(L, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, out);
+        if (n < 0) fprintf(stderr, "munbox: %s\n", munbox_last_error());
+        fclose(out);
+    }
+done:
+    if (L) L->close(L);
+    return 0;
+}
+```
+
+Key points:
+* `munbox_process_new` returns the final layer after applying every recognisable format wrapper.
+* If the final layer exposes `open`, iterate forks (data first, then resource if present) across all files.
+* If only `read` is present, treat it as a single raw stream.
+* `munbox_last_error()` returns a descriptive message after any `MUNBOX_ERROR` (-1) return.
+
+For AppleDouble emission or Mac metadata preservation, copy the approach used in `cmd/main.c`.
 
 ## **How to Contribute**
 
