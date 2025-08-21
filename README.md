@@ -105,47 +105,39 @@ int main(int argc, char **argv) {
     L = munbox_process_new(L); /* Detect & chain: e.g. file.sit.hqx -> hqx -> bin -> sit */
     if (!L) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); return 1; }
 
-    if (L->open) {
-        munbox_file_info_t info; int rc = L->open(L, MUNBOX_OPEN_FIRST, &info);
-        char current_name[256] = ""; FILE *out = NULL;
-        while (rc == 1) {
-            /* Start a new output file when filename changes */
-            if (strcmp(current_name, info.filename) != 0) {
-                if (out) fclose(out);
-                strncpy(current_name, info.filename, sizeof current_name - 1);
-                current_name[sizeof current_name - 1] = '\0';
-                out = fopen(current_name[0] ? current_name : "untitled", "wb");
-                if (!out) { perror("fopen"); break; }
-                if (info.has_metadata) {
-                    printf("%s (TYPE '%c%c%c%c' CREATOR '%c%c%c%c')\n", current_name,
-                           (info.type>>24)&0xFF,(info.type>>16)&0xFF,(info.type>>8)&0xFF,info.type&0xFF,
-                           (info.creator>>24)&0xFF,(info.creator>>16)&0xFF,(info.creator>>8)&0xFF,info.creator&0xFF);
-                }
+    munbox_file_info_t info; int rc = L->open(L, MUNBOX_OPEN_FIRST, &info);
+    char current_name[256] = ""; FILE *out = NULL;
+    while (rc == 1) {
+        /* Start a new output file when filename changes */
+        if (strcmp(current_name, info.filename) != 0) {
+            if (out) fclose(out);
+            strncpy(current_name, info.filename, sizeof current_name - 1);
+            current_name[sizeof current_name - 1] = '\0';
+            out = fopen(current_name[0] ? current_name : "untitled", "wb");
+            if (!out) { perror("fopen"); break; }
+            if (info.has_metadata) {
+                printf("%s (TYPE '%c%c%c%c' CREATOR '%c%c%c%c')\n", current_name,
+                        (info.type>>24)&0xFF,(info.type>>16)&0xFF,(info.type>>8)&0xFF,info.type&0xFF,
+                        (info.creator>>24)&0xFF,(info.creator>>16)&0xFF,(info.creator>>8)&0xFF,info.creator&0xFF);
             }
-            /* Read current fork */
-            unsigned char buf[65536];
-            for (;;) {
-                ssize_t n = L->read(L, buf, sizeof buf);
-                if (n < 0) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); goto done; }
-                if (n == 0) break; /* fork finished */
-                if (info.fork_type == MUNBOX_FORK_DATA) {
-                    fwrite(buf, 1, (size_t)n, out);
-                } else {
-                    /* Resource fork bytes: store elsewhere or create AppleDouble as needed */
-                    /* (Example just discards them) */
-                }
-            }
-            rc = L->open(L, MUNBOX_OPEN_NEXT, &info);
         }
-        if (out) fclose(out);
-    } else if (L->read) {
-        /* Single unnamed stream */
-        FILE *out = fopen("output.bin", "wb");
-        unsigned char buf[4096]; ssize_t n;
-        while ((n = L->read(L, buf, sizeof buf)) > 0) fwrite(buf, 1, (size_t)n, out);
-        if (n < 0) fprintf(stderr, "munbox: %s\n", munbox_last_error());
-        fclose(out);
+        /* Read current fork */
+        unsigned char buf[65536];
+        for (;;) {
+            ssize_t n = L->read(L, buf, sizeof buf);
+            if (n < 0) { fprintf(stderr, "munbox: %s\n", munbox_last_error()); goto done; }
+            if (n == 0) break; /* fork finished */
+            if (info.fork_type == MUNBOX_FORK_DATA) {
+                fwrite(buf, 1, (size_t)n, out);
+            } else {
+                /* Resource fork bytes: store elsewhere or create AppleDouble as needed */
+                /* (Example just discards them) */
+            }
+        }
+        rc = L->open(L, MUNBOX_OPEN_NEXT, &info);
     }
+    if (out) fclose(out);
+
 done:
     if (L) L->close(L);
     return 0;
